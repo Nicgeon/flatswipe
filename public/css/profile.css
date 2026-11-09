@@ -16,13 +16,8 @@ textarea.pf-input { line-height:1.55; resize:vertical; }
 /* ── Page header ──────────────────────────────────────── */
 .pf-page { max-width:1344px; width:100%; margin:0 auto; box-sizing:border-box; }
 .pf-header { display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:14px; }
-.pf-back {
-  width:44px; height:44px; flex:none; border-radius:12px; border:1px solid var(--border); background:var(--bg2);
-  color:var(--text); font-size:1.5rem; line-height:1; cursor:pointer;
-}
 .pf-header-text { flex:1; min-width:0; }
 .pf-header .view-title { margin:0; }
-.pf-crumb { display:none; font-size:.82rem; color:var(--text2); margin-bottom:4px; }
 .pf-status { display:flex; align-items:center; gap:6px; font-size:var(--fs-small); color:var(--text2); margin-top:2px; }
 .pf-status-dot { width:7px; height:7px; border-radius:50%; background:var(--like); flex:none; }
 .pf-status[data-state="pending"] .pf-status-dot, .pf-status[data-state="saving"] .pf-status-dot { background:var(--accent); }
@@ -137,8 +132,6 @@ textarea.pf-input { line-height:1.55; resize:vertical; }
 /* ── Desktop: 3 columns ───────────────────────────────── */
 @media (min-width: 1000px) {
   .pf-page { padding:6px 14px 40px; }
-  .pf-back { display:none; }
-  .pf-crumb { display:block; }
   .pf-header { justify-content:space-between; align-items:flex-end; margin-bottom:22px; }
   .pf-header .view-title { font-size:2rem; }
   .pf-layout[data-mode="desktop"] {

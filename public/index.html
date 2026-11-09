@@ -130,8 +130,12 @@
         <div class="card-stack" id="card-stack">
           <div class="empty-state" id="empty-swipe">
             <div class="empty-icon i" data-icon="cards"></div>
-            <p>Keine Inserate mehr.</p>
-            <p class="empty-sub">Füge welche hinzu oder richte einen Suchagenten ein.</p>
+            <p>Keine neuen Inserate.</p>
+            <p class="empty-sub">Neue Treffer deiner Suchagenten landen automatisch hier.</p>
+            <div class="empty-actions">
+              <button class="btn-primary empty-action" data-open-sheet="job-sheet" data-sheet-view="jobs"><span class="i sm" data-icon="agent"></span>Suchagent einrichten</button>
+              <button class="btn-secondary empty-action" data-open-sheet="add-sheet" data-sheet-view="add"><span class="i sm" data-icon="link"></span>Inserat per Link</button>
+            </div>
           </div>
         </div>
         <div class="swipe-actions" id="swipe-actions" style="display:none">
@@ -226,7 +230,13 @@
         <div id="groups-list" class="groups-grid"></div>
       </div>
       <div id="group-detail" style="display:none">
-        <button class="btn-ghost back-btn" id="back-to-groups"><span class="i sm" data-icon="back"></span>Zurück</button>
+        <div class="sub-head">
+          <button class="sub-back" id="back-to-groups" type="button" aria-label="Zurück zu Gruppen"><span class="i" data-icon="back"></span></button>
+          <div class="sub-head-text">
+            <div class="sub-crumb">Gruppen</div>
+            <h2 class="view-title" id="group-detail-title"></h2>
+          </div>
+        </div>
         <div id="group-detail-content"></div>
       </div>
     </div>
@@ -287,9 +297,9 @@
   <div id="view-profile" class="view">
     <div class="view-content pf-page">
       <div class="pf-header">
-        <button class="pf-back" id="pf-back" type="button" aria-label="Zurück">‹</button>
+        <button class="sub-back" id="pf-back" type="button" aria-label="Zurück"><span class="i" data-icon="back"></span></button>
         <div class="pf-header-text">
-          <div class="pf-crumb">Profil › Bewerber-Profil</div>
+          <div class="sub-crumb">Profil</div>
           <h2 class="view-title" id="pf-title">Bewerber-Profil</h2>
           <div class="pf-status" id="pf-status" data-state="saved" role="status" aria-live="polite">
             <span class="pf-status-dot"></span><span id="pf-status-text">Alle Änderungen gespeichert</span>
@@ -629,6 +639,14 @@
       <span class="dt-spacer"></span>
       <button class="dt-btn" id="detail-quick-share" type="button" aria-label="Inserat teilen" title="Inserat teilen"><span class="i" data-icon="share"></span></button>
       <a class="dt-btn" id="detail-quick-original" href="#" target="_blank" rel="noopener" aria-label="Original-Inserat öffnen" title="Original-Inserat öffnen"><span class="i" data-icon="external"></span></a>
+      <div class="dt-more">
+        <button class="dt-btn" id="detail-more-btn" type="button" aria-label="Weitere Aktionen" aria-haspopup="menu" aria-expanded="false" title="Weitere Aktionen"><span class="i" data-icon="dots"></span></button>
+        <div class="dt-menu" id="detail-more-menu" role="menu" hidden>
+          <a class="dt-menu-item" id="detail-original-link" role="menuitem" href="#" target="_blank" rel="noopener"><span class="i sm" data-icon="external"></span>Original-Inserat öffnen</a>
+          <button class="dt-menu-item" id="detail-map-btn" role="menuitem" type="button" style="display:none"><span class="i sm" data-icon="pin"></span>In Karten-App öffnen</button>
+          <button class="dt-menu-item danger" id="detail-report-btn" role="menuitem" type="button"><span class="i sm" data-icon="flag"></span>Als offline melden</button>
+        </div>
+      </div>
     </div>
 
     <div class="detail-scroll" id="detail-scroll">
@@ -668,9 +686,6 @@
         <div class="detail-action-row">
           <div id="detail-contact" class="detail-contact"></div>
           <button class="detail-msg-btn" id="detail-msg-btn" type="button"><span class="i sm" data-icon="chat"></span>Nachricht vorbereiten</button>
-          <button class="detail-map-btn" id="detail-map-btn" type="button" style="display:none"><span class="i sm" data-icon="pin"></span>In Karten-App öffnen</button>
-          <a class="detail-original-link" id="detail-original-link" href="#" target="_blank" rel="noopener"><span class="i sm" data-icon="external"></span>Original-Inserat öffnen</a>
-          <button class="detail-report-btn" id="detail-report-btn" type="button"><span class="i sm" data-icon="flag"></span>Als offline melden</button>
         </div>
       </div>
     </div>
@@ -691,6 +706,7 @@
       <button class="action-btn dislike"   data-rate="dislike"   type="button" aria-pressed="false" aria-label="Nein"       title="Nein"><span class="i lg" data-icon="x"></span></button>
       <button class="action-btn superlike" data-rate="superlike" type="button" aria-pressed="false" aria-label="Super-Like" title="Super!"><span class="i lg" data-icon="star"></span></button>
       <button class="action-btn like"      data-rate="like"      type="button" aria-pressed="false" aria-label="Ja"         title="Ja!"><span class="i lg" data-icon="heart"></span></button>
+      <button class="detail-bar-msg" id="detail-bar-msg" type="button"><span class="i sm" data-icon="chat"></span>Nachricht</button>
     </div>
   </div>
 </div>

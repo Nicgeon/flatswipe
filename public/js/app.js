@@ -520,7 +520,10 @@ const detailView = {
     $id('detail-swipe-actions').style.display = (this.fromSwipe && !opts.embedded) ? 'flex' : 'none';
     // From "Bewertet" or a group: the own rating can be changed right here (not for archived listings)
     this.onChange = opts.onChange || null;
-    $id('detail-rate-bar').style.display = (!this.fromSwipe && !opts.embedded && !opts.isArchive) ? 'flex' : 'none';
+    const rateBar = !this.fromSwipe && !opts.embedded && !opts.isArchive;
+    $id('detail-rate-bar').style.display = rateBar ? 'flex' : 'none';
+    // Mit Bewertungsleiste sitzt "Nachricht" dort (immer erreichbar), sonst am Ende des Inhalts
+    $id('detail-msg-btn').style.display = rateBar ? 'none' : '';
     this._renderRating();
 
     this._renderGallery();
@@ -528,6 +531,7 @@ const detailView = {
 
   close() {
     if (this.embedded) return;                       // the docked panel is not closable
+    detailMenu.close();
     this._contact?.destroy(); this._contact = null;
     $id('detail-view').style.display = 'none';
     document.removeEventListener('keydown', detailView._key);
@@ -753,9 +757,22 @@ $id('detail-report-btn').onclick = async () => {
   }
 };
 
-$id('detail-msg-btn').onclick = () => {
+$id('detail-msg-btn').onclick = $id('detail-bar-msg').onclick = () => {
   if (detailView.listing) messageModal.open(detailView.listing, { groupId: detailView.groupId || null });
 };
+
+// ⋯-Menü in der oberen Leiste: Original, Karten-App, offline melden
+const detailMenu = {
+  btn: $id('detail-more-btn'), el: $id('detail-more-menu'),
+  open()  { this.el.hidden = false; this.btn.setAttribute('aria-expanded', 'true'); this.el.querySelector('.dt-menu-item:not([style*="none"])')?.focus(); },
+  close() { this.el.hidden = true;  this.btn.setAttribute('aria-expanded', 'false'); },
+};
+detailMenu.btn.addEventListener('click', e => { e.stopPropagation(); detailMenu.el.hidden ? detailMenu.open() : detailMenu.close(); });
+detailMenu.el.addEventListener('click', () => detailMenu.close());
+document.addEventListener('click', e => { if (!detailMenu.el.hidden && !e.target.closest('.dt-more')) detailMenu.close(); });
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && !detailMenu.el.hidden) { e.stopImmediatePropagation(); detailMenu.close(); detailMenu.btn.focus(); }
+}, true);
 
 // ══════════════════════════════════════════════════════════
 //  CARD BUILDERS
@@ -1581,7 +1598,10 @@ const sheets = {
 };
 document.addEventListener('click', e => {
   const opener = e.target.closest('[data-open-sheet]');
-  if (opener) return sheets.open(opener.dataset.openSheet);
+  if (opener) {
+    if (opener.dataset.sheetView) showView(opener.dataset.sheetView);   // z. B. vom leeren Swipe-Stapel aus
+    return sheets.open(opener.dataset.openSheet);
+  }
   const closer = e.target.closest('[data-close-sheet]');
   if (closer) return sheets.close(closer.closest('.sheet').id);
   if (e.target.classList && e.target.classList.contains('sheet')) sheets.close(e.target.id);   // Tipp auf den Hintergrund
@@ -1889,9 +1909,9 @@ async function openGroupDetail(group, opts = {}) {
     </div>`;
   }).join('');
 
+  $id('group-detail-title').textContent = group.name;
   $id('group-detail-content').innerHTML = `
     <div class="group-detail-header">
-      <div class="group-detail-name">${esc(group.name)}</div>
       <div class="invite-row">
         <span style="font-size:.8rem;color:var(--text2)">Einladungscode:</span>
         <span class="invite-code-big">${esc(group.invite_code)}</span>

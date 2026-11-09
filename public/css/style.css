@@ -322,9 +322,7 @@ button:focus-visible, a:focus-visible, summary:focus-visible { outline:2px solid
 .group-code { font-family:monospace;font-size:.8rem;color:var(--accent-text);background:var(--bg3);border-radius:5px;padding:2px 7px;cursor:pointer; }
 .group-code:hover { background:rgba(232,201,122,.12); }
 
-.back-btn { margin-bottom:14px; }
 .group-detail-header { background:var(--bg2);border:1px solid var(--border);border-radius:14px;padding:18px;margin-bottom:18px; }
-.group-detail-name { font-family:'Fraunces',serif;font-size:1.3rem;font-weight:700;margin-bottom:8px; }
 .invite-row { display:flex;align-items:center;gap:10px;flex-wrap:wrap; }
 .invite-code-big { font-family:monospace;font-size:1.15rem;color:var(--accent-text);background:var(--bg3);border-radius:8px;padding:4px 14px;letter-spacing:3px; }
 
@@ -923,26 +921,6 @@ button:focus-visible, a:focus-visible, summary:focus-visible { outline:2px solid
 
 .detail-action-row { display:flex; flex-direction:column; gap:10px; margin-top:22px; }
 .detail-action-row > * { display:flex; align-items:center; justify-content:center; gap:8px; min-height:48px; }
-.detail-map-btn {
-  background:var(--bg3); border:1px solid var(--border); border-radius:12px;
-  padding:0 12px; font-size:.9rem; color:var(--text); cursor:pointer;
-  transition:background .15s, border-color .15s;
-}
-.detail-map-btn:hover { background:var(--bg2); border-color:var(--border-hover); }
-.detail-original-link {
-  background:transparent;
-  border:1px solid var(--accent-text); color:var(--accent-text); border-radius:12px;
-  padding:0 12px; font-size:.9rem; font-weight:600; text-decoration:none;
-  transition:background .15s;
-}
-.detail-original-link:hover { background:var(--accent-soft); }
-.detail-report-btn {
-  background:transparent; border:1px solid var(--border); border-radius:12px;
-  padding:0 12px; font-size:.85rem; color:var(--text2); cursor:pointer;
-  transition:background .15s, border-color .15s, color .15s;
-}
-.detail-report-btn:hover { background:rgba(240,80,96,.08); border-color:rgba(240,80,96,.4); color:var(--dislike); }
-
 /* ── Swipe actions (only shown when opened from the Swipe page) ── */
 .detail-swipe-actions {
   display:flex; align-items:center; justify-content:center; gap:14px;
@@ -1353,7 +1331,6 @@ body.rated-selecting #view-rated .view-content { padding-bottom:150px; }
 .notify-label:has(> .i) { justify-content:flex-start; }
 .notify-label > .i { color:var(--text2); }
 .notify-matrix-header .i { color:var(--text2); }
-.btn-ghost.back-btn { padding-left:10px; }
 .lb-close .ic, .lb-arrow .ic { width:22px; height:22px; }
 .lb-arrow .ic { width:26px; height:26px; }
 .lb-close, .lb-arrow { display:flex; align-items:center; justify-content:center; }
@@ -1471,3 +1448,30 @@ body.rated-selecting #view-rated .view-content { padding-bottom:150px; }
 .me-stats b { font-family:'Fraunces',serif;font-size:1.2rem; }
 .me-stats span { font-size:var(--fs-tiny);color:var(--text2); }
 .mh-row[hidden] { display:none; }
+
+/* ── Detailansicht: ⋯-Menü oben rechts (seltene Aktionen) ── */
+.dt-more { position:relative;pointer-events:auto; }
+.dt-menu { position:absolute;right:0;top:calc(100% + 8px);min-width:230px;background:var(--bg2);border:1px solid var(--border);border-radius:14px;
+  box-shadow:var(--shadow);padding:6px;display:flex;flex-direction:column;z-index:30; }
+.dt-menu[hidden] { display:none; }
+.dt-menu-item { display:flex;align-items:center;gap:10px;width:100%;padding:11px 12px;border:0;border-radius:10px;background:none;color:var(--text);
+  font:inherit;font-size:.92rem;text-align:left;text-decoration:none;cursor:pointer; }
+.dt-menu-item:hover, .dt-menu-item:focus-visible { background:var(--hover-bg); }
+.dt-menu-item.danger { color:var(--dislike); }
+
+/* "Nachricht" als Hauptaktion in der Bewertungsleiste */
+.detail-bar-msg { display:inline-flex;align-items:center;gap:7px;height:48px;padding:0 18px;margin-left:6px;border-radius:24px;border:0;
+  background:var(--accent);color:var(--on-accent);font:inherit;font-weight:600;cursor:pointer;flex:none; }
+.detail-bar-msg:hover { filter:brightness(1.05); }
+@media (max-width: 480px) {
+  .detail-rate-bar { gap:10px; }
+  .detail-rate-bar .detail-rate-label { position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0); }
+  .detail-rate-bar .action-btn { width:50px;height:50px; }
+  .detail-rate-bar .action-btn.like { width:56px;height:56px; }
+  .detail-bar-msg { padding:0 14px;margin-left:2px; }
+}
+
+/* Leerer Swipe-Stapel: direkte Wege statt Sackgasse */
+.empty-actions { display:flex;flex-wrap:wrap;gap:10px;justify-content:center;margin-top:18px; }
+.empty-actions .empty-action { margin-top:0; }
+.btn-secondary.empty-action { width:auto;display:inline-flex;align-items:center;gap:6px; }
