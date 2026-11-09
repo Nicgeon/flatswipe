@@ -1,7 +1,7 @@
 services:
-  wohnungsswipe:
+  flatswipe:
     build: .
-    container_name: wohnungsswipe
+    container_name: flatswipe
     ports:
       - "3000:3000"
     volumes:
