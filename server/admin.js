@@ -89,6 +89,7 @@ async function cmdPassword(db, out, identifier, newPassword) {
   const usage = 'Verwendung: node server/cli.js password <username|email> <neues-passwort>';
   if (!identifier || !newPassword) throw new AdminError(usage);
   if (newPassword.length < 6) throw new AdminError('Passwort muss mindestens 6 Zeichen lang sein.');
+  if (newPassword.length > 200) throw new AdminError('Passwort ist zu lang (höchstens 200 Zeichen).');
   const user = needUser(db, identifier, usage);
   const hash = await bcrypt.hash(newPassword, 10);
   // pw_version hochzählen meldet alle bestehenden Sitzungen dieses Kontos ab (wie beim

@@ -890,7 +890,7 @@ function buildListCard(listing, opts = {}) {
     </div>` : ''}`;
   const noteHtml = `
       <div class="contact-note-wrap" data-note-wrap>
-        <textarea class="contact-note" placeholder="Notiz (optional): Wann kontaktiert, Antwort, etc." data-note-text>${esc(listing.contact_note || '')}</textarea>
+        <textarea class="contact-note" maxlength="2000" placeholder="Notiz (optional): Wann kontaktiert, Antwort, etc." data-note-text>${esc(listing.contact_note || '')}</textarea>
         <div class="contact-note-actions">
           <button class="contact-note-save" data-note-save>Speichern</button>
           <button data-note-cancel>Abbrechen</button>

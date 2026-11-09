@@ -673,6 +673,19 @@ const requireAuth = (req, res, next) =>
 // check means the request fails as an ordinary, logged 400 well before that.
 const isStr = v => typeof v === 'string';
 
+// Höchstlängen für gespeicherte Eingaben (Profilfelder und Vorlagen begrenzt profile.js).
+// Zu lange Eingaben werden mit einer Meldung abgelehnt statt still gekürzt.
+const MAX_LEN = { username: 40, email: 254, password: 200, groupName: 80, jobLabel: 100,
+                  url: 2000, ntfyTopic: 100, pushKey: 200, note: 2000 };
+// true (und 400 gesendet), wenn ein Text länger als erlaubt ist
+function tooLong(res, value, max, what) {
+  if (!isStr(value) || value.trim().length <= max) return false;
+  res.status(400).json({ error: `${what} ist zu lang (höchstens ${max} Zeichen)` });
+  return true;
+}
+const pwTooLong = (res, pw) => isStr(pw) && pw.length > MAX_LEN.password
+  && (res.status(400).json({ error: `Passwort ist zu lang (höchstens ${MAX_LEN.password} Zeichen)` }), true);
+
 // ── Auth ───────────────────────────────────────────────────
 app.post('/api/auth/register', authLimiter, async (req, res) => {
   const { username, email, password } = req.body;
@@ -680,6 +693,8 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
     return res.status(400).json({ error: 'Alle Felder erforderlich' });
   if (password.length < 6)
     return res.status(400).json({ error: 'Passwort mindestens 6 Zeichen' });
+  if (tooLong(res, username, MAX_LEN.username, 'Username') || tooLong(res, email, MAX_LEN.email, 'E-Mail')
+      || pwTooLong(res, password)) return;
   if (dbGet('SELECT id FROM users WHERE email=? OR username=?', [email.toLowerCase(), username]))
     return res.status(409).json({ error: 'Username oder E-Mail bereits vergeben' });
   const hash = await bcrypt.hash(password, 10);
@@ -744,6 +759,7 @@ app.post('/api/auth/reset-password', authLimiter, async (req, res) => {
   const { token, password } = req.body;
   if (!isStr(token) || !isStr(password) || !token || !password || password.length < 6)
     return res.status(400).json({ error: 'Ungültige Anfrage' });
+  if (pwTooLong(res, password)) return;
   const user = dbGet("SELECT * FROM users WHERE reset_token=?", [token]);
   if (!user) return res.status(400).json({ error: 'Ungültiger oder abgelaufener Token' });
   if (new Date(user.reset_expires + 'Z') < new Date())
@@ -760,6 +776,7 @@ app.post('/api/auth/reset-password', authLimiter, async (req, res) => {
 app.put('/api/user/username', requireAuth, (req, res) => {
   const { username } = req.body;
   if (!isStr(username) || !username.trim()) return res.status(400).json({ error: 'Username darf nicht leer sein' });
+  if (tooLong(res, username, MAX_LEN.username, 'Username')) return;
   if (dbGet('SELECT id FROM users WHERE username=? AND id!=?', [username.trim(), req.session.userId]))
     return res.status(409).json({ error: 'Username bereits vergeben' });
   dbRun('UPDATE users SET username=? WHERE id=?', [username.trim(), req.session.userId]);
@@ -771,6 +788,7 @@ app.put('/api/user/username', requireAuth, (req, res) => {
 app.put('/api/user/email', requireAuth, authLimiter, async (req, res) => {
   const { email, currentPassword } = req.body;
   if (!isStr(email) || !email.includes('@')) return res.status(400).json({ error: 'Gültige E-Mail erforderlich' });
+  if (tooLong(res, email, MAX_LEN.email, 'E-Mail')) return;
   // The email address is where password resets go — changing it must need
   // the password, or a briefly hijacked session becomes a permanent takeover.
   if (!isStr(currentPassword) || !currentPassword)
@@ -789,6 +807,7 @@ app.put('/api/user/password', requireAuth, async (req, res) => {
   const { currentPassword, newPassword } = req.body;
   if (!isStr(currentPassword) || !isStr(newPassword) || !currentPassword || !newPassword || newPassword.length < 6)
     return res.status(400).json({ error: 'Ungültige Anfrage' });
+  if (pwTooLong(res, newPassword)) return;
   const user = dbGet('SELECT * FROM users WHERE id=?', [req.session.userId]);
   if (!await bcrypt.compare(currentPassword, user.password_hash))
     return res.status(401).json({ error: 'Aktuelles Passwort falsch' });
@@ -807,6 +826,7 @@ app.put('/api/user/notifications', requireAuth, (req, res) => {
           notify_digest_interval, ntfy_topic, ntfy_server, notify_threshold, notify_matrix } = req.body;
   if (ntfy_server != null && !isStr(ntfy_server)) return res.status(400).json({ error: 'Ungültiger ntfy-Server' });
   if (ntfy_topic  != null && !isStr(ntfy_topic))  return res.status(400).json({ error: 'Ungültiges ntfy-Topic' });
+  if (tooLong(res, ntfy_server, MAX_LEN.url, 'ntfy-Server') || tooLong(res, ntfy_topic, MAX_LEN.ntfyTopic, 'ntfy-Topic')) return;
   if (ntfy_server && ntfy_server.trim() && !isUrlAllowed(ntfy_server.trim()))
     return res.status(400).json({ error: 'ntfy-Server: bitte eine öffentliche http(s)-Adresse angeben' });
   const validIntervals = ['instant','15min','1h','6h','daily'];
@@ -1285,7 +1305,8 @@ app.get('/api/push/vapid-key', (req, res) => {
 
 app.post('/api/push/subscribe', requireAuth, (req, res) => {
   const { endpoint, keys } = req.body;
-  if (!isStr(endpoint) || !isStr(keys?.p256dh) || !isStr(keys?.auth) || !endpoint)
+  if (!isStr(endpoint) || !isStr(keys?.p256dh) || !isStr(keys?.auth) || !endpoint
+      || endpoint.length > MAX_LEN.url || keys.p256dh.length > MAX_LEN.pushKey || keys.auth.length > MAX_LEN.pushKey)
     return res.status(400).json({ error: 'Ungültige Subscription' });
   // Real push services (FCM, Mozilla, Apple) are always public https URLs;
   // anything else would just make this server send requests wherever the
@@ -1388,6 +1409,7 @@ async function checkAndNotifyMatch(listingId, groupId) {
 app.post('/api/listings/add', requireAuth, async (req, res) => {
   const { url, visibility, visibility_id } = req.body;
   if (!isStr(url) || !url) return res.status(400).json({ error: 'URL erforderlich' });
+  if (tooLong(res, url, MAX_LEN.url, 'URL')) return;
   if (!isUrlAllowed(url)) return res.status(400).json({ error: 'Ungültige URL' });
 
   const vis   = ['global','private','group'].includes(visibility) ? visibility : 'global';
@@ -1801,6 +1823,8 @@ app.get('/api/archive', requireAuth, (req, res) => {
 app.post('/api/contacts', requireAuth, (req, res) => {
   const { listingId, groupId, note } = req.body;
   if (!listingId) return res.status(400).json({ error: 'listingId erforderlich' });
+  if (note != null && !isStr(note)) return res.status(400).json({ error: 'Ungültige Notiz' });
+  if (tooLong(res, note, MAX_LEN.note, 'Notiz')) return;
   if (groupId) {
     // verify user is in group
     if (!dbGet('SELECT 1 FROM group_members WHERE group_id=? AND user_id=?', [groupId, req.session.userId]))
@@ -1834,6 +1858,8 @@ app.delete('/api/contacts/:listingId', requireAuth, (req, res) => {
 // Update note on contact
 app.patch('/api/contacts/:listingId', requireAuth, (req, res) => {
   const { note, groupId } = req.body;
+  if (note != null && !isStr(note)) return res.status(400).json({ error: 'Ungültige Notiz' });
+  if (tooLong(res, note, MAX_LEN.note, 'Notiz')) return;
   if (groupId) {
     if (!isGroupMember(groupId, req.session.userId)) return res.status(403).json({ error: 'Kein Zugriff auf diese Gruppe' });
     dbRun('UPDATE contacts SET note=? WHERE listing_id=? AND group_id=?', [note||'', req.params.listingId, groupId]);
@@ -1878,7 +1904,8 @@ app.get('/api/groups/mine', requireAuth, (req, res) => {
 
 app.post('/api/groups/create', requireAuth, (req, res) => {
   const { name } = req.body;
-  if (!name) return res.status(400).json({ error: 'Gruppenname erforderlich' });
+  if (!isStr(name) || !name.trim()) return res.status(400).json({ error: 'Gruppenname erforderlich' });
+  if (tooLong(res, name, MAX_LEN.groupName, 'Gruppenname')) return;
   const code = crypto.randomBytes(4).toString('hex').toUpperCase();   // 8 chars
   const r    = dbRun('INSERT INTO groups_table (name,invite_code,created_by) VALUES (?,?,?)',
     [name.trim(), code, req.session.userId]);
@@ -2118,6 +2145,7 @@ app.post('/api/jobs', requireAuth, (req, res) => {
   const { label, search_url, interval_min = 60 } = req.body;
   if (!isStr(label) || !label.trim())                  return res.status(400).json({ error: 'Bezeichnung erforderlich' });
   if (!isStr(search_url) || !search_url.startsWith('http')) return res.status(400).json({ error: 'Gültige Such-URL erforderlich' });
+  if (tooLong(res, label, MAX_LEN.jobLabel, 'Bezeichnung') || tooLong(res, search_url, MAX_LEN.url, 'Such-URL')) return;
   if (!isUrlAllowed(search_url)) return res.status(400).json({ error: 'Ungültige URL' });
   const urlProblem = validateSearchUrl(search_url);
   if (urlProblem) return res.status(400).json({ error: urlProblem });

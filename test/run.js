@@ -28,6 +28,7 @@ const TESTS = [
   ['unit/formatting.test.js'], ['unit/documents.test.js'],
   ['api/core.test.js', { seed: true }],
   ['api/admin-cli.test.js', { seed: true }],
+  ['api/limits.test.js', {}],
   ['api/duplicates.test.js', { plan: dupPlan }],
 ];
 if (withUi) for (const size of [['390', '844'], ['1440', '900']]) TESTS.push(

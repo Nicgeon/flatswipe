@@ -64,11 +64,11 @@
     <form id="login-form" class="auth-form active">
       <div class="field-group">
         <label>E-Mail</label>
-        <input type="email" id="login-email" placeholder="deine@email.de" required />
+        <input type="email" id="login-email" maxlength="254" placeholder="deine@email.de" required />
       </div>
       <div class="field-group">
         <label>Passwort</label>
-        <input type="password" id="login-password" placeholder="••••••••" required />
+        <input type="password" id="login-password" maxlength="200" placeholder="••••••••" required />
       </div>
       <button type="submit" class="btn-primary">Einloggen</button>
       <button type="button" class="btn-link" id="show-forgot">Passwort vergessen?</button>
@@ -77,15 +77,15 @@
     <form id="register-form" class="auth-form">
       <div class="field-group">
         <label>Username</label>
-        <input type="text" id="reg-username" placeholder="Dein Name" required />
+        <input type="text" id="reg-username" maxlength="40" placeholder="Dein Name" required />
       </div>
       <div class="field-group">
         <label>E-Mail</label>
-        <input type="email" id="reg-email" placeholder="deine@email.de" required />
+        <input type="email" id="reg-email" maxlength="254" placeholder="deine@email.de" required />
       </div>
       <div class="field-group">
         <label>Passwort</label>
-        <input type="password" id="reg-password" placeholder="Mindestens 6 Zeichen" required />
+        <input type="password" id="reg-password" maxlength="200" placeholder="Mindestens 6 Zeichen" required />
       </div>
       <button type="submit" class="btn-primary">Account erstellen</button>
       <p class="form-error" id="reg-error"></p>
@@ -95,7 +95,7 @@
       <p style="color:var(--text2);font-size:.875rem">Gib deine E-Mail ein – wir schicken dir einen Reset-Link.</p>
       <div class="field-group">
         <label>E-Mail</label>
-        <input type="email" id="forgot-email" placeholder="deine@email.de" />
+        <input type="email" id="forgot-email" maxlength="254" placeholder="deine@email.de" />
       </div>
       <button class="btn-primary" id="forgot-submit">Reset-Link senden</button>
       <button class="btn-link" id="hide-forgot">Zurück zum Login</button>
@@ -159,7 +159,7 @@
       <div class="card-form">
         <div class="field-group">
           <label>Inserat-Link</label>
-          <input type="url" id="listing-url" placeholder="https://www.kleinanzeigen.de/s-anzeige/..." />
+          <input type="url" id="listing-url" maxlength="2000" placeholder="https://www.kleinanzeigen.de/s-anzeige/..." />
         </div>
         <div class="field-group">
           <label>Sichtbarkeit</label>
@@ -365,11 +365,11 @@
       <div class="card-form">
         <div class="field-group">
           <label>Bezeichnung</label>
-          <input type="text" id="job-label" placeholder="z.B. Berlin 2-Zimmer bis 1200€" />
+          <input type="text" id="job-label" maxlength="100" placeholder="z.B. Berlin 2-Zimmer bis 1200€" />
         </div>
         <div class="field-group">
           <label>Such-URL (Suchergebnisseite)</label>
-          <input type="url" id="job-url" placeholder="https://www.kleinanzeigen.de/s-wohnung-mieten/berlin/c203l3331" />
+          <input type="url" id="job-url" maxlength="2000" placeholder="https://www.kleinanzeigen.de/s-wohnung-mieten/berlin/c203l3331" />
         </div>
         <div class="field-group" style="max-width:180px">
           <label>Intervall (Minuten)</label>
@@ -488,7 +488,7 @@
         <div class="section-label">Username ändern</div>
         <div class="inline-row">
           <div class="field-group" style="flex:1">
-            <input type="text" id="settings-username" placeholder="Neuer Username" />
+            <input type="text" id="settings-username" maxlength="40" placeholder="Neuer Username" />
           </div>
           <button class="btn-secondary compact" id="save-username-btn">Speichern</button>
         </div>
@@ -501,13 +501,13 @@
         <div class="section-label">E-Mail ändern</div>
         <div class="inline-row">
           <div class="field-group" style="flex:1">
-            <input type="email" id="settings-email" placeholder="neue@email.de" />
+            <input type="email" id="settings-email" maxlength="254" placeholder="neue@email.de" />
           </div>
           <button class="btn-secondary compact" id="save-email-btn">Speichern</button>
         </div>
         <div class="field-group">
           <label>Aktuelles Passwort zur Bestätigung</label>
-          <input type="password" id="settings-email-pw" placeholder="••••••••" autocomplete="current-password" />
+          <input type="password" id="settings-email-pw" maxlength="200" placeholder="••••••••" autocomplete="current-password" />
         </div>
         <p class="form-error"   id="settings-email-error"></p>
         <p class="form-success" id="settings-email-ok"></p>
@@ -518,15 +518,15 @@
         <div class="section-label">Passwort ändern</div>
         <div class="field-group">
           <label>Aktuelles Passwort</label>
-          <input type="password" id="settings-pw-current" placeholder="••••••••" />
+          <input type="password" id="settings-pw-current" maxlength="200" placeholder="••••••••" />
         </div>
         <div class="field-group">
           <label>Neues Passwort</label>
-          <input type="password" id="settings-pw-new" placeholder="Mindestens 6 Zeichen" />
+          <input type="password" id="settings-pw-new" maxlength="200" placeholder="Mindestens 6 Zeichen" />
         </div>
         <div class="field-group">
           <label>Wiederholen</label>
-          <input type="password" id="settings-pw-confirm" placeholder="••••••••" />
+          <input type="password" id="settings-pw-confirm" maxlength="200" placeholder="••••••••" />
         </div>
         <button class="btn-primary" id="save-password-btn">Passwort ändern</button>
         <p class="form-error"   id="settings-pw-error"></p>
@@ -560,13 +560,13 @@
           </div>
           <div class="inline-row" style="width:100%">
             <div class="field-group" style="flex:1">
-              <input type="text" id="ntfy-topic" placeholder="mein-topic-name" />
+              <input type="text" id="ntfy-topic" maxlength="100" placeholder="mein-topic-name" />
             </div>
             <button class="btn-secondary compact" id="save-ntfy-btn">Speichern</button>
           </div>
           <div class="field-group" style="width:100%">
             <label>Server (leer lassen für ntfy.sh)</label>
-            <input type="url" id="ntfy-server" placeholder="https://ntfy.sh" />
+            <input type="url" id="ntfy-server" maxlength="2000" placeholder="https://ntfy.sh" />
           </div>
           <p class="form-success" id="ntfy-ok"></p>
           <p class="notify-sub" style="font-size:.72rem;color:var(--text3)">
@@ -816,7 +816,7 @@
 <div id="create-group-modal" class="modal" style="display:none">
   <div class="modal-card">
     <h3>Gruppe erstellen</h3>
-    <div class="field-group"><label>Name</label><input type="text" id="new-group-name" placeholder="z.B. WG-Suche 2025" /></div>
+    <div class="field-group"><label>Name</label><input type="text" id="new-group-name" maxlength="80" placeholder="z.B. WG-Suche 2025" /></div>
     <div class="modal-actions">
       <button class="btn-ghost" id="cancel-create">Abbrechen</button>
       <button class="btn-primary" id="confirm-create">Erstellen</button>
@@ -827,7 +827,7 @@
 <div id="join-group-modal" class="modal" style="display:none">
   <div class="modal-card">
     <h3>Gruppe beitreten</h3>
-    <div class="field-group"><label>Einladungscode</label><input type="text" id="join-code" placeholder="A1B2C3D4" style="text-transform:uppercase" autocomplete="off" /></div>
+    <div class="field-group"><label>Einladungscode</label><input type="text" id="join-code" maxlength="8" placeholder="A1B2C3D4" style="text-transform:uppercase" autocomplete="off" /></div>
     <p class="join-hint">Ein Mitglied der Gruppe bestätigt deinen Beitritt, danach siehst du die Gruppe.</p>
     <div class="modal-actions">
       <button class="btn-ghost" id="cancel-join">Abbrechen</button>
