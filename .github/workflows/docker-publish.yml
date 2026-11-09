@@ -1,0 +1,98 @@
+name: Docker Hub
+
+# Baut das Image und veröffentlicht es als nicgeon/wohnungsswipe auf Docker Hub –
+# NUR bei einem Release (oder von Hand). Pushes und Merges lösen nichts aus,
+# damit keine Actions-Minuten verbraucht werden.
+#
+# Release-Ablauf:
+#   1. "version" in package.json erhöhen und nach main mergen
+#   2. Auf GitHub unter "Releases" → "Draft a new release" einen neuen Tag
+#      vX.Y.Z auf main anlegen, "Generate release notes" klicken, veröffentlichen
+#   → das Image wird als :vX.Y.Z gebaut, und als :latest, wenn das Release keine
+#     Vorabversion ("pre-release") ist.
+#
+# Von Hand: Actions-Tab → "Docker Hub" → "Run workflow" baut den gewählten Branch
+# mit der Version aus package.json als :vX.Y.Z und :latest.
+# Voraussetzung: Secrets DOCKERHUB_USERNAME und DOCKERHUB_TOKEN.
+# Die Actions sind auf Commit-Hashes festgelegt (Version als Kommentar), damit ein
+# verschobener Tag bei einem Anbieter keinen fremden Code in den Build bringt.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+concurrency:
+  group: docker-publish
+  cancel-in-progress: false
+
+env:
+  IMAGE: nicgeon/wohnungsswipe
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Version bestimmen
+        id: ver
+        env:
+          EVENT: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          PRERELEASE: ${{ github.event.release.prerelease }}
+        run: |
+          PKG=$(node -p "require('./package.json').version")
+          LATEST=true
+          if [ "$EVENT" = "release" ]; then
+            if ! [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::Release-Tag '$RELEASE_TAG' hat nicht das Format vX.Y.Z – es wird kein Image gebaut."
+              exit 1
+            fi
+            V="${RELEASE_TAG#v}"
+            if [ "$V" != "$PKG" ]; then
+              echo "::warning::Release $RELEASE_TAG, aber package.json enthält Version $PKG."
+            fi
+            if [ "$PRERELEASE" = "true" ]; then LATEST=false; fi
+          else
+            V="$PKG"
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "latest=$LATEST" >> "$GITHUB_OUTPUT"
+          echo "::notice::Baue :v$V$([ "$LATEST" = true ] && echo ' und :latest')."
+
+      - name: Docker Hub login
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: QEMU (arm64 für Raspberry Pi / ARM-Server)
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+
+      - name: Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Tags und Labels
+        id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
+        with:
+          images: ${{ env.IMAGE }}
+          flavor: latest=false
+          tags: |
+            type=raw,value=v${{ steps.ver.outputs.version }}
+            type=raw,value=latest,enable=${{ steps.ver.outputs.latest == 'true' }}
+
+      - name: Build und Push
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

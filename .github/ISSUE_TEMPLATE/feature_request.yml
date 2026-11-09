@@ -1,0 +1,20 @@
+name: Idee / Wunsch
+description: Vorschlag für eine neue Funktion oder Verbesserung
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Worum geht es?
+      description: Welches Problem soll gelöst werden?
+    validations:
+      required: true
+  - type: textarea
+    id: vorschlag
+    attributes:
+      label: Vorschlag
+      description: Wie könnte es aussehen?
+  - type: input
+    id: portal
+    attributes:
+      label: Betrifft es ein bestimmtes Portal?

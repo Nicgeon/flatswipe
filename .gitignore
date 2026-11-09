@@ -1,0 +1,27 @@
+# Abhängigkeiten
+node_modules/
+
+# Laufzeitdaten: Datenbank, VAPID-Schlüssel, Session-Secret
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# Konfiguration mit echten Werten (nur .env.example gehört ins Repo)
+.env
+.env.*
+!.env.example
+
+# Logs und Test-/Coverage-Ausgaben
+*.log
+npm-debug.log*
+coverage/
+playwright-report/
+test-results/
+
+# Editor und Betriebssystem
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

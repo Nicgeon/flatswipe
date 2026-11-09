@@ -1,0 +1,20 @@
+/* Schriften werden mit der App ausgeliefert statt von Google Fonts geladen (keine Verbindung
+   zu Drittservern beim Seitenaufruf). Beide stehen unter der SIL Open Font License 1.1,
+   siehe public/fonts/OFL-*.txt. Quelle: Fontsource (@fontsource-variable/*, Version 5.3.0),
+   Untermenge "latin" (enthält Umlaute, ß und €). */
+@font-face {
+  font-family: 'Fraunces';
+  font-style: normal;
+  font-display: swap;
+  font-weight: 100 900;
+  src: url('/fonts/fraunces-variable-latin.woff2') format('woff2-variations'),
+       url('/fonts/fraunces-variable-latin.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'DM Sans';
+  font-style: normal;
+  font-display: swap;
+  font-weight: 100 1000;
+  src: url('/fonts/dm-sans-variable-latin.woff2') format('woff2-variations'),
+       url('/fonts/dm-sans-variable-latin.woff2') format('woff2');
+}

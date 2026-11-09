@@ -1,0 +1,2567 @@
+/* ══════════════════════════════════════════════════════════
+   WohnungsSwipe – Frontend
+══════════════════════════════════════════════════════════ */
+
+const state = {
+  user:       null,
+  groups:     [],
+  swipeQueue: [],
+  ratedFilter: 'all',
+  lastSwipe:  null, // { listing, action } – powers the "Sofort-Undo" button
+  ratedSelected: new Set(), // listing ids ticked for bulk removal in "Bewertet"
+};
+
+// ── Helpers ───────────────────────────────────────────────
+const $id = id => document.getElementById(id);
+
+async function api(path, opts = {}) {
+  const res = await fetch(path, {
+    headers: { 'Content-Type': 'application/json' },
+    ...opts,
+    body: opts.body ? JSON.stringify(opts.body) : undefined,
+  });
+  return res.json();
+}
+
+// Leading emoji/symbols in toast texts are rendered as line icons (tone: ok / err).
+const TOAST_ICONS = {
+  '✓': ['check', 'ok'], '✅': ['check', 'ok'], '❌': ['x', 'err'], '⚠️': ['alert', 'err'], '⚠': ['alert', 'err'],
+  '🔗': ['link'], '🚫': ['flag'], '📬': ['mail', 'ok'], '↩': ['undo'], '🗑': ['trash'], '📋': ['copy'], '👋': ['send'],
+  '🎉': ['heart', 'ok'], '💚': ['heart', 'ok'], '⭐': ['star'], '🔕': ['bell'], '🔔': ['bell', 'ok'], '⏸': ['pause'], '▶': ['play'], '📦': ['archive'],
+};
+function toast(msg, ms = 2800) {
+  const t = $id('toast');
+  const m = /^(\S+?)\s+(.*)$/s.exec(String(msg));
+  const hit = m && TOAST_ICONS[m[1]];
+  t.classList.remove('ok', 'err'); if (hit && hit[1]) t.classList.add(hit[1]);
+  t.innerHTML = hit ? `${icon(hit[0], 'sm')}<span>${esc(m[2])}</span>` : `<span>${esc(String(msg))}</span>`;
+  t.classList.add('show');
+  clearTimeout(t._t);
+  t._t = setTimeout(() => t.classList.remove('show'), ms);
+}
+
+// Button/label content with a leading line icon
+const withIcon = (name, text, cls = 'sm') => `${icon(name, cls)}${text}`;
+const contactMenuLabel = on => on ? withIcon('check', 'Angeschrieben (Notiz bearbeiten)') : withIcon('mail', 'Als angeschrieben markieren');
+
+// Blurred copy of the photo behind a 'contain'-fitted image: the whole photo is always visible, the frame is always filled.
+const phStyle = src => `--ph:url('${esc(String(src || '')).replace(/'/g, '%27')}')`;
+
+function setErr(id, msg) { const el = $id(id); if (el) el.textContent = msg; }
+function setOk(id, msg)  { const el = $id(id); if (el) el.textContent = msg; }
+function clr(...ids)     { ids.forEach(id => { const el = $id(id); if (el) el.textContent = ''; }); }
+
+function esc(s) {
+  return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// Listing URLs come from user input / scraped pages; only ever link to
+// http(s) so an old or crafted row can't turn a link into javascript:…
+function safeHref(url) {
+  return /^https?:\/\//i.test(String(url || '').trim()) ? String(url).trim() : '#';
+}
+
+// Portal keys as stored → names as people know them
+const PLATFORM_NAMES = { kleinanzeigen: 'Kleinanzeigen', immoscout: 'ImmoScout24', immowelt: 'Immowelt', rentola: 'rentola',
+                         meinestadt: 'meinestadt', vonovia: 'Vonovia', leg: 'LEG', gewoba: 'GEWOBA' };
+const platformName = p => PLATFORM_NAMES[p] || p || 'Inserat';
+// Badge on a swipe card: portal, plus how many other portals list the same flat ("leg +1")
+const platformBadge = l => `${l.platform || 'inserat'}${l.also_on?.length ? ` +${l.also_on.length}` : ''}`;
+
+function parseTags(json) {
+  try { return JSON.parse(json || '[]'); } catch { return []; }
+}
+
+function parseImages(listing) {
+  try { return JSON.parse(listing.images_json || '[]'); } catch { return listing.image_url ? [listing.image_url] : []; }
+}
+
+function priceHtml(listing, large = false) {
+  const cold  = (listing.price_cold || '').trim();
+  const total = (listing.price      || '').trim();
+  if (!cold && !total) return '';
+  const mainSize = large ? 'font-size:1.1rem' : '';
+  let html = `<div class="card-price-row">`;
+  if (cold) {
+    html += `<span class="card-price-main" style="${mainSize}">${esc(cold)}</span>`;
+    html += `<span class="price-tag-cold">Kalt</span>`;
+    if (total && total !== cold) html += `<span class="price-tag-warm">${esc(total)} warm</span>`;
+  } else {
+    html += `<span class="card-price-main" style="${mainSize}">${esc(total)}</span>`;
+  }
+  return html + '</div>';
+}
+
+// ── Screens ───────────────────────────────────────────────
+function showScreen(id) {
+  document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+  $id(id).classList.add('active');
+}
+
+// Which bottom-bar / header tab a page belongs to
+const TAB_OF = { swipe:'swipe', rated:'rated', groups:'groups', jobs:'search', add:'search', archive:'search',
+                 me:'me', profile:'me', settings:'me' };
+const SEARCH_VIEWS = ['jobs', 'add', 'archive'];
+const SEARCH_LABELS = { jobs: 'Agenten', add: 'Hinzufügen', archive: 'Archiv' };
+
+// Navigation (history, back button, deep links) lives in nav.js; this only paints a page.
+function showView(name) { nav.show(name); }
+
+function renderView(name) {
+  if (name !== 'rated' && state.ratedSelectMode) setRatedSelectMode(false);
+  // The profile page autosaves; make sure nothing is lost when leaving it.
+  if (name !== 'profile') window.pfFlush?.();
+  document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+  $id(`view-${name}`).classList.add('active');
+  $id('swipe-counter').style.display = name === 'swipe' ? '' : 'none';
+
+  const tab = TAB_OF[name];
+  document.querySelectorAll('.tab-nav').forEach(b => {
+    const on = b.dataset.tab === tab;
+    b.classList.toggle('active', on);
+    if (on) b.setAttribute('aria-current', 'page'); else b.removeAttribute('aria-current');
+  });
+  $id('account-btn')?.classList.toggle('on', tab === 'me');
+  if (SEARCH_VIEWS.includes(name)) state.lastSearchView = name;
+  document.querySelectorAll('[data-subtabs] [data-goto]').forEach(b => {
+    const on = b.dataset.goto === name;
+    b.classList.toggle('on', on); b.setAttribute('aria-selected', on ? 'true' : 'false');
+  });
+
+  if (name === 'me' || SEARCH_VIEWS.includes(name)) window.renderAccountMeta?.();
+  if (name === 'swipe')    loadSwipeQueue();
+  if (name === 'rated')    loadRated();
+  if (name === 'groups')   loadGroups();
+  if (name === 'jobs')     loadJobs();
+  if (name === 'settings') loadSettings();
+  if (name === 'profile')  window.loadProfilePage?.();
+  if (name === 'archive')  loadArchive();
+  if (name === 'add')      loadMyAddedListings();
+  syncDetailMount();
+}
+
+nav.setRenderer(renderView);
+
+// Tab bar (phones: bottom, desktop: header). "Suche" reopens the part of it you were last in.
+document.querySelectorAll('.tab-nav[data-tab]').forEach(btn =>
+  btn.addEventListener('click', () =>
+    showView(btn.dataset.tab === 'search' ? (state.lastSearchView || 'jobs') : btn.dataset.view))
+);
+$id('account-btn').addEventListener('click', () => showView('me'));
+
+// Tabs inside "Suche": Agenten · Hinzufügen · Archiv
+document.querySelectorAll('[data-subtabs]').forEach(el => {
+  el.setAttribute('role', 'tablist');
+  el.innerHTML = SEARCH_VIEWS.map(v =>
+    `<button type="button" role="tab" aria-selected="false" data-goto="${v}">${SEARCH_LABELS[v]}${v === 'jobs' || v === 'archive' ? `<span class="cnt" data-count="${v === 'jobs' ? 'agents' : 'archive'}" hidden></span>` : ''}</button>`
+  ).join('');
+});
+
+document.querySelectorAll('[data-goto]').forEach(btn =>
+  btn.addEventListener('click', () => showView(btn.dataset.goto))
+);
+// "Zurück" inside a page = one level up (same as the phone's back gesture)
+document.querySelectorAll('[data-back]').forEach(btn =>
+  btn.addEventListener('click', () => nav.back())
+);
+
+// ══════════════════════════════════════════════════════════
+//  AUTH
+// ══════════════════════════════════════════════════════════
+document.querySelector('.auth-tabs').addEventListener('click', e => {
+  const tab = e.target.dataset.tab;
+  if (!tab) return;
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.auth-form').forEach(f => f.classList.remove('active'));
+  e.target.classList.add('active');
+  $id(`${tab}-form`).classList.add('active');
+  $id('forgot-panel').style.display = 'none';
+});
+
+$id('login-form').addEventListener('submit', async e => {
+  e.preventDefault(); clr('login-error');
+  const d = await api('/api/auth/login', { method: 'POST', body: {
+    email: $id('login-email').value, password: $id('login-password').value,
+  }});
+  if (d.error) return setErr('login-error', d.error);
+  onLogin(d);
+});
+
+$id('register-form').addEventListener('submit', async e => {
+  e.preventDefault(); clr('reg-error');
+  const d = await api('/api/auth/register', { method: 'POST', body: {
+    username: $id('reg-username').value, email: $id('reg-email').value, password: $id('reg-password').value,
+  }});
+  if (d.error) return setErr('reg-error', d.error);
+  onLogin(d);
+});
+
+// Forgot password
+$id('show-forgot').addEventListener('click', () => {
+  $id('login-form').style.display = 'none';
+  $id('forgot-panel').style.display = 'flex';
+  clr('forgot-ok','forgot-error');
+});
+$id('hide-forgot').addEventListener('click', () => {
+  $id('forgot-panel').style.display = 'none';
+  $id('login-form').style.display = '';
+});
+$id('forgot-submit').addEventListener('click', async () => {
+  const email = $id('forgot-email').value.trim();
+  clr('forgot-ok','forgot-error');
+  if (!email) return setErr('forgot-error', 'E-Mail eingeben');
+  const d = await api('/api/auth/forgot-password', { method: 'POST', body: { email } });
+  if (d.error) return setErr('forgot-error', d.error);
+  setOk('forgot-ok', d.message || 'E-Mail gesendet (falls Account existiert)');
+});
+
+async function onLogin(data) {
+  state.user = data;
+  setNavUser(data.username);
+  showScreen('app-screen');
+  await enterApp();
+}
+
+// Loads what every page needs, then opens the page named in the address (#/suche …)
+async function enterApp() {
+  await loadGroups();
+  nav.start();
+  if (nav.current !== 'swipe') loadSwipeQueue();     // keeps the badge on the Swipen tab right
+  openSharedListingFromUrl();
+}
+
+async function doLogout() {
+  await api('/api/auth/logout', { method: 'POST' });
+  state.user = null; state.groups = [];
+  nav.stop();
+  if ('serviceWorker' in navigator) {
+    const reg = await navigator.serviceWorker.getRegistration().catch(()=>null);
+    if (reg) { const sub = await reg.pushManager.getSubscription(); if (sub) sub.unsubscribe(); }
+  }
+  showScreen('auth-screen');
+}
+$id('logout-btn').addEventListener('click', doLogout);
+
+// ══════════════════════════════════════════════════════════
+//  LIGHTBOX
+// ══════════════════════════════════════════════════════════
+const lb = {
+  imgs: [], idx: 0,
+  open(images, start = 0) {
+    if (!images?.length) return;
+    this.imgs = images; this.idx = start;
+    $id('lightbox').style.display = 'flex';
+    this.render();
+    document.addEventListener('keydown', lb._key);
+  },
+  close() {
+    $id('lightbox').style.display = 'none';
+    document.removeEventListener('keydown', lb._key);
+  },
+  go(d)  { this.idx = (this.idx + d + this.imgs.length) % this.imgs.length; this.render(); },
+  to(i)  { this.idx = i; this.render(); },
+  render() {
+    $id('lb-img').src = this.imgs[this.idx];
+    $id('lb-counter').textContent = `${this.idx + 1} / ${this.imgs.length}`;
+    $id('lb-prev').disabled = this.imgs.length <= 1;
+    $id('lb-next').disabled = this.imgs.length <= 1;
+    const tb = $id('lb-thumbnails'); tb.innerHTML = '';
+    this.imgs.forEach((src, i) => {
+      const t = document.createElement('img');
+      t.src = src; t.className = 'lb-thumb' + (i === this.idx ? ' active' : '');
+      t.onclick = () => lb.to(i);
+      tb.appendChild(t);
+    });
+    tb.querySelector('.lb-thumb.active')?.scrollIntoView({ inline:'center', block:'nearest' });
+  },
+  _key(e) {
+    if (e.key === 'Escape')      lb.close();
+    if (e.key === 'ArrowLeft')   lb.go(-1);
+    if (e.key === 'ArrowRight')  lb.go(1);
+  }
+};
+$id('lb-close').onclick = () => lb.close();
+$id('lb-prev').onclick  = () => lb.go(-1);
+$id('lb-next').onclick  = () => lb.go(1);
+$id('lightbox').addEventListener('click', e => { if (e.target === $id('lightbox')) lb.close(); });
+
+// ══════════════════════════════════════════════════════════
+//  DETAIL VIEW
+//  A full in-app view of a listing (all photos, full description,
+//  a map shortcut, and — only when opened from the Swipe page — the
+//  swipe actions themselves) so tapping through to the original
+//  listing becomes the exception rather than the default habit.
+// ══════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════
+//  "Angeschrieben" – one place for the contact state of a listing
+//  (own, or per group when groupId is set). Used by the detail view,
+//  the message dialog and the cards; cards are kept in sync through
+//  applyContactToCards().
+// ══════════════════════════════════════════════════════════
+const contactApi = {
+  q: g => g ? `?groupId=${g}` : '',
+  async get(id, g)        { const r = await api(`/api/contacts/${id}${this.q(g)}`); return r.contact || null; },
+  mark(id, g, note = '')  { return api('/api/contacts', { method: 'POST', body: { listingId: id, groupId: g || null, note } }); },
+  unmark(id, g)           { return api(`/api/contacts/${id}${this.q(g)}`, { method: 'DELETE' }); },
+  note(id, g, note)       { return api(`/api/contacts/${id}`, { method: 'PATCH', body: { note, groupId: g || null } }); },
+};
+
+// Keeps already rendered cards (group results, "Bewertet") in step with a change made elsewhere.
+function applyContactToCards(listingId, groupId, contacted, note = '') {
+  const noteTxt = note ? ' · ' + note.substring(0, 40) : '';
+  if (!groupId) {
+    const rated = _ratedAll.find(l => Number(l.id) === Number(listingId));
+    if (rated) { rated.contacted = contacted ? 1 : 0; rated.contact_note = contacted ? note : ''; }
+  }
+  const scope = groupId ? `[data-group-id="${groupId}"]` : ':not([data-group-id])';
+  document.querySelectorAll(`.list-card.rc[data-listing-id="${listingId}"]${scope}`).forEach(card => {
+    const badge = card.querySelector('.contacted-badge');
+    if (badge) { badge.hidden = !contacted; badge.textContent = 'Angeschrieben' + noteTxt; }
+    const lbl = card.querySelector('.rc-contact span'); if (lbl) lbl.textContent = contacted ? 'Notiz' : 'Als angeschrieben';
+    const mi = card.querySelector('[data-menu-action="contact-toggle"]'); if (mi) mi.innerHTML = contactMenuLabel(contacted);
+    if (!contacted) card.querySelector('[data-note-wrap]')?.classList.remove('open');
+  });
+}
+
+// Toggle button (+ note field once marked). `el` is a container; returns {nudge()}.
+function mountContactBar(el, listingId, groupId) {
+  let contact = null, alive = true;
+  const draw = () => {
+    const on = !!contact;
+    el.innerHTML = `
+      <div class="cbar${on ? ' on' : ''}">
+        <button type="button" class="cbar-toggle" aria-pressed="${on}">${icon(on ? 'check' : 'mail', 'sm')}<span>${on ? 'Angeschrieben' : 'Als angeschrieben markieren'}</span></button>
+        ${on ? `<input type="text" class="cbar-note" maxlength="200" placeholder="Notiz (optional): z. B. Besichtigung Fr 17 Uhr" value="${esc(contact.note || '')}" aria-label="Notiz zum Anschreiben">` : ''}
+      </div>`;
+  };
+  el.innerHTML = '<div class="cbar"><button type="button" class="cbar-toggle" disabled>…</button></div>';
+  contactApi.get(listingId, groupId).then(c => { if (alive) { contact = c; draw(); } }).catch(() => {});
+  el.onclick = async e => {
+    if (!e.target.closest('.cbar-toggle') || e.target.closest('[disabled]')) return;
+    if (!contact) {
+      const r = await contactApi.mark(listingId, groupId, '');
+      if (!r.success) { toast('❌ ' + (r.error || 'Fehler')); return; }
+      contact = { note: '' }; draw(); applyContactToCards(listingId, groupId, true, '');
+      toast('✓ Als angeschrieben markiert');
+      el.querySelector('.cbar-note')?.focus();
+    } else {
+      const r = await contactApi.unmark(listingId, groupId);
+      if (!r.success) { toast('❌ ' + (r.error || 'Fehler')); return; }
+      contact = null; draw(); applyContactToCards(listingId, groupId, false);
+      toast('Markierung entfernt');
+    }
+  };
+  el.onchange = async e => {
+    if (!e.target.classList.contains('cbar-note') || !contact) return;
+    contact.note = e.target.value.trim();
+    await contactApi.note(listingId, groupId, contact.note);
+    applyContactToCards(listingId, groupId, true, contact.note);
+    toast('✓ Notiz gespeichert');
+  };
+  return {
+    nudge() { el.querySelector('.cbar')?.classList.add('nudge'); },
+    destroy() { alive = false; el.onclick = null; el.onchange = null; el.innerHTML = ''; },
+  };
+}
+
+// Kosten / Details lists, shared by the detail view and the desktop quick view.
+function listingLists(listing) {
+  const cold  = (listing.price_cold || '').trim();
+  const total = (listing.price      || '').trim();
+  const costRows = [
+    ['Kaltmiete',      cold],
+    ['Nebenkosten',    listing.nebenkosten],
+    ['Heizkosten',     listing.heizkosten],
+    ['Kaution',        listing.kaution],
+  ].filter(([, v]) => v && v.trim());
+  if (cold && total && total !== cold) costRows.push(['Warmmiete', total, true]);
+  const factRows = [
+    ['Wohnungstyp',    listing.property_type],
+    ['Verfügbar ab',   listing.available_from],
+  ].filter(([, v]) => v && v.trim());
+  const list = rows => `<ul class="detail-list">${rows.map(([l, v, isTotal]) =>
+    `<li${isTotal ? ' class="total"' : ''}><span>${esc(l)}</span><b>${esc(v)}</b></li>`).join('')}</ul>`;
+  return {
+    costsHtml: costRows.length ? `<div class="detail-section-label">Kosten</div>${list(costRows)}` : '',
+    factsHtml: factRows.length ? `<div class="detail-section-label">Details</div>${list(factRows)}` : '',
+  };
+}
+
+// Small OpenStreetMap embed around the listing's coordinates ('' without coordinates).
+function osmEmbedHtml(listing) {
+  if (!Number.isFinite(listing.latitude) || !Number.isFinite(listing.longitude)) return '';
+  const lat = listing.latitude, lon = listing.longitude, d = 0.006;
+  const bbox = `${lon - d}%2C${lat - d}%2C${lon + d}%2C${lat + d}`;
+  return `<iframe src="https://www.openstreetmap.org/export/embed.html?bbox=${bbox}&layer=mapnik&marker=${lat}%2C${lon}" loading="lazy" referrerpolicy="no-referrer-when-downgrade"></iframe>`;
+}
+
+const detailView = {
+  listing:   null,
+  imgs:      [],
+  idx:       0,
+  fromSwipe: false,
+
+  // Modal: the detail panel lives in the #detail-view overlay.
+  open(listing, opts = {}) {
+    const inner = document.querySelector('.detail-view-inner');
+    if (inner.parentElement !== $id('detail-view')) $id('detail-view').appendChild(inner);
+    inner.classList.remove('embedded');
+    this.embedded = false;
+    this._populate(listing, opts);
+    $id('detail-view').style.display = 'flex';
+    document.addEventListener('keydown', detailView._key);
+  },
+
+  // Desktop swipe page: the same panel, docked next to the card stack (no overlay, no key handler).
+  embed(listing) {
+    this.embedded = true;
+    this._populate(listing, { fromSwipe: true, embedded: true });
+  },
+
+  _populate(listing, opts = {}) {
+    this.listing   = listing;
+    this.imgs      = parseImages(listing);
+    this.idx       = 0;
+    this.fromSwipe = !!opts.fromSwipe;
+    this.groupId   = opts.groupId || null;
+
+    $id('detail-platform').textContent = listing.platform || 'Inserat';
+    this._renderAlsoOn();
+    $id('detail-title').textContent    = listing.title || 'Inserat';
+
+    const cold  = (listing.price_cold || '').trim();
+    const total = (listing.price      || '').trim();
+    $id('detail-price').innerHTML = cold
+      ? `<b>${esc(cold)}</b><span>kalt${total && total !== cold ? ` · ${esc(total)} warm` : ''}</span>`
+      : (total ? `<b>${esc(total)}</b>` : '<span>Preis nicht angegeben</span>');
+
+    const locEl = $id('detail-loc');
+    locEl.innerHTML = listing.location ? `${icon('pin', 'sm')}${esc(listing.location)}` : '';
+    locEl.style.display = listing.location ? '' : 'none';
+
+    const metaParts = [];
+    if (listing.size)  metaParts.push(`${icon('area', 'sm')}${esc(listing.size)}`);
+    if (listing.rooms) metaParts.push(`${icon('door', 'sm')}${esc(listing.rooms)} Zi.`);
+    $id('detail-meta').innerHTML = metaParts.map(m => `<span class="detail-meta-item">${m}</span>`).join('');
+
+    // Cost list (Kosten) and a second list for the remaining facts (Details).
+    // Only rendered when at least one field was actually scraped, so older
+    // listings without this data don't show an empty box.
+    const { costsHtml, factsHtml } = listingLists(listing);
+    const costsEl = $id('detail-costs');
+    costsEl.style.display = (costsHtml || factsHtml) ? '' : 'none';
+    costsEl.innerHTML = costsHtml + factsHtml;
+
+    this._contact?.destroy();
+    this._contact = mountContactBar($id('detail-contact'), listing.id, this.groupId);
+
+    this._loadChanges(listing.id);
+
+    const tags = parseTags(listing.tags_json);
+    $id('detail-tags').innerHTML = tags.map(t => `<span class="detail-tag">${esc(t)}</span>`).join('');
+    $id('detail-tags').style.display = tags.length ? '' : 'none';
+    $id('detail-tags-label').style.display = tags.length ? '' : 'none';
+    $id('detail-scroll').scrollTop = 0;
+    document.querySelector('.detail-body').scrollTop = 0;
+    document.querySelector('.detail-topbar').classList.remove('scrolled');
+
+    $id('detail-description').textContent = listing.description?.trim() || 'Keine Beschreibung verfügbar.';
+
+    // Status badge (reserved/offline) — mirrors the small badges shown on cards
+    const statusBadge = $id('detail-status-badge');
+    if (listing.status === 'reserved') {
+      statusBadge.textContent = 'Reserviert'; statusBadge.className = 'detail-status-badge status-reserved'; statusBadge.style.display = '';
+    } else if (listing.status === 'offline') {
+      statusBadge.textContent = 'Offline'; statusBadge.className = 'detail-status-badge status-offline'; statusBadge.style.display = '';
+    } else {
+      statusBadge.style.display = 'none';
+    }
+
+    // Embedded map — when Kleinanzeigen (or another platform) exposes real
+    // coordinates via og:latitude/og:longitude, show an actual OpenStreetMap
+    // preview right in the detail view instead of only a text-based link.
+    // OSM's embed endpoint needs no API key and works for any public location.
+    const mapEmbed = $id('detail-map-embed');
+    const mapLabel = $id('detail-map-label');
+    const hasCoords = Number.isFinite(listing.latitude) && Number.isFinite(listing.longitude);
+    if (hasCoords) {
+      mapEmbed.innerHTML = osmEmbedHtml(listing);
+      mapEmbed.style.display = ''; mapLabel.style.display = '';
+    } else {
+      mapEmbed.style.display = 'none'; mapLabel.style.display = 'none';
+      mapEmbed.innerHTML = '';
+    }
+
+    // "Open in maps app" — precise coordinates when we have them, otherwise
+    // fall back to a text search built from the scraped address.
+    const mapBtn = $id('detail-map-btn');
+    if (hasCoords) {
+      mapBtn.style.display = '';
+      mapBtn.onclick = () => {
+        window.open(`https://www.google.com/maps/search/?api=1&query=${listing.latitude}%2C${listing.longitude}`, '_blank', 'noopener');
+      };
+    } else if (listing.location?.trim()) {
+      mapBtn.style.display = '';
+      mapBtn.onclick = () => {
+        const q = encodeURIComponent(listing.location.trim());
+        window.open(`https://www.google.com/maps/search/?api=1&query=${q}`, '_blank', 'noopener');
+      };
+    } else {
+      mapBtn.style.display = 'none';
+    }
+
+    $id('detail-original-link').href = safeHref(listing.url);
+    $id('detail-quick-original').href = safeHref(listing.url);
+
+    // Swipe actions only make sense (and only stay in sync with the queue)
+    // when opened from the swipe page itself.
+    $id('detail-swipe-actions').style.display = (this.fromSwipe && !opts.embedded) ? 'flex' : 'none';
+    // From "Bewertet" or a group: the own rating can be changed right here (not for archived listings)
+    this.onChange = opts.onChange || null;
+    $id('detail-rate-bar').style.display = (!this.fromSwipe && !opts.embedded && !opts.isArchive) ? 'flex' : 'none';
+    this._renderRating();
+
+    this._renderGallery();
+  },
+
+  close() {
+    if (this.embedded) return;                       // the docked panel is not closable
+    this._contact?.destroy(); this._contact = null;
+    $id('detail-view').style.display = 'none';
+    document.removeEventListener('keydown', detailView._key);
+    this.listing = null;
+    syncDetailMount();                               // back to the docked panel on wide swipe pages
+  },
+
+  // The same flat on other portals: links, and a way to undo a wrong match
+  _renderAlsoOn() {
+    const also = this.listing?.also_on || [];
+    const box = $id('detail-also-on');
+    box.hidden = !also.length;
+    box.innerHTML = also.length ? `<span class="dao-label">${icon('copy', 'sm')}Auch auf</span>` + also.map(a =>
+      `<span class="dao-item"><a href="${esc(safeHref(a.url))}" target="_blank" rel="noopener">${esc(platformName(a.platform))}${icon('external', 'sm')}</a>` +
+      `<button type="button" class="dao-split" data-not-dup="${a.id}" title="Das ist eine andere Wohnung">Kein Duplikat?</button></span>`).join('') : '';
+  },
+
+  _renderRating() {
+    const mine = this.listing?.my_swipe || '';
+    document.querySelectorAll('#detail-rate-bar [data-rate]').forEach(b => b.setAttribute('aria-pressed', b.dataset.rate === mine ? 'true' : 'false'));
+    $id('detail-rate-label').textContent = mine && mine !== 'skip' ? 'Deine Bewertung' : 'Noch nicht bewertet';
+  },
+
+  _renderGallery() {
+    const img   = $id('detail-gallery-img');
+    const ph    = $id('detail-gallery-placeholder');
+    const thumbs = $id('detail-gallery-thumbs');
+
+    const gal = $id('detail-gallery');
+    if (this.imgs.length) {
+      img.style.display = ''; ph.style.display = 'none';
+      img.src = this.imgs[this.idx];
+      gal.style.setProperty('--ph', phStyle(this.imgs[this.idx]).slice(5));
+      gal.classList.add('has-photo');
+    } else {
+      img.style.display = 'none'; ph.style.display = 'flex';
+      gal.classList.remove('has-photo'); gal.style.removeProperty('--ph');
+    }
+    $id('detail-gallery-expand').style.display = this.imgs.length ? '' : 'none';
+
+    $id('detail-gallery-counter').textContent = this.imgs.length ? `${this.idx + 1} / ${this.imgs.length}` : '';
+    $id('detail-gallery-dots').innerHTML = this.imgs.length > 1 && this.imgs.length <= 12
+      ? this.imgs.map((_, i) => `<i class="${i === this.idx ? 'on' : ''}"></i>`).join('') : '';
+    $id('detail-gallery-prev').style.display  = this.imgs.length > 1 ? '' : 'none';
+    $id('detail-gallery-next').style.display  = this.imgs.length > 1 ? '' : 'none';
+
+    thumbs.innerHTML = '';
+    if (this.imgs.length > 1) {
+      this.imgs.forEach((src, i) => {
+        const t = document.createElement('img');
+        t.src = src; t.className = 'detail-gallery-thumb' + (i === this.idx ? ' active' : '');
+        t.onclick = () => { this.idx = i; this._renderGallery(); };
+        thumbs.appendChild(t);
+      });
+      thumbs.querySelector('.detail-gallery-thumb.active')?.scrollIntoView({ inline: 'center', block: 'nearest' });
+    }
+  },
+
+  galleryGo(d) {
+    if (!this.imgs.length) return;
+    this.idx = (this.idx + d + this.imgs.length) % this.imgs.length;
+    this._renderGallery();
+  },
+
+  async _loadChanges(listingId) {
+    const el = $id('detail-changes');
+    el.style.display = 'none'; el.innerHTML = '';
+    const fieldLabels = { title: 'Titel', price: 'Warmmiete', price_cold: 'Kaltmiete', size: 'Größe', rooms: 'Zimmer' };
+    try {
+      const { changes = [] } = await api(`/api/listings/${listingId}/changes`);
+      if (!changes.length) return;
+      // Only render if this is still the listing being viewed (guards
+      // against a slow request resolving after the user already switched).
+      if (!this.listing || this.listing.id !== listingId) return;
+      el.style.display = '';
+      el.innerHTML = `
+        <div class="detail-section-label">Änderungsverlauf</div>
+        ${changes.slice(0, 8).map(c => {
+          const label = fieldLabels[c.field] || c.field;
+          const date  = new Date(c.changed_at + 'Z').toLocaleDateString('de-DE', { day: '2-digit', month: '2-digit', year: 'numeric' });
+          return `<div class="detail-change-row">
+            <span class="detail-change-date">${date}</span>
+            <span class="detail-change-desc"><strong>${esc(label)}</strong> geändert: ${esc(c.old_value || '—')} → ${esc(c.new_value || '—')}</span>
+          </div>`;
+        }).join('')}
+      `;
+    } catch (e) { /* silently skip — history is a nice-to-have, not critical */ }
+  },
+
+  _key(e) {
+    if ($id('lightbox').style.display === 'flex') return;   // the lightbox handles its own keys (Esc closes only the photo)
+    if (e.key === 'Escape') { detailView.close(); return; }
+
+    if (detailView.fromSwipe) {
+      // Opened from the Swipe page: arrow keys drive the same swipe
+      // actions as the main page, so users never lose keyboard flow just
+      // because they tapped into the detail view. Gallery photos are still
+      // browsable via the on-screen ‹ › buttons.
+      if (e.key === 'Backspace' || (e.key.toLowerCase() === 'z' && !e.ctrlKey && !e.metaKey)) {
+        if (state.lastSwipe) { e.preventDefault(); undoLastSwipe(); detailView.close(); }
+        return;
+      }
+      if (!detailView.listing) return;
+      if (e.key === 'ArrowLeft')  { e.preventDefault(); doSwipe(detailView.listing, 'dislike');   detailView.close(); }
+      if (e.key === 'ArrowRight') { e.preventDefault(); doSwipe(detailView.listing, 'like');      detailView.close(); }
+      if (e.key === 'ArrowUp')    { e.preventDefault(); doSwipe(detailView.listing, 'superlike'); detailView.close(); }
+      if (e.key === 'ArrowDown')  { e.preventDefault(); doSwipe(detailView.listing, 'skip');      detailView.close(); }
+    } else {
+      // Opened from Bewertet/Archiv/Gruppen/etc. — no swipe actions apply
+      // here, so arrow keys are free for browsing the photo gallery.
+      if (e.key === 'ArrowLeft')  detailView.galleryGo(-1);
+      if (e.key === 'ArrowRight') detailView.galleryGo(1);
+    }
+  },
+};
+
+$id('detail-close').onclick        = () => detailView.close();
+// The floating top bar gets a soft background once content scrolls underneath it.
+(() => {
+  const tb = document.querySelector('.detail-topbar');
+  const sync = e => tb.classList.toggle('scrolled', e.target.scrollTop > 140);
+  $id('detail-scroll').addEventListener('scroll', sync, { passive: true });
+  document.querySelector('.detail-body').addEventListener('scroll', sync, { passive: true });
+})();
+// Swipe the photo left/right on touch screens
+(() => {
+  const g = $id('detail-gallery'); let x0 = null, y0 = null;
+  g.addEventListener('touchstart', e => { x0 = e.touches[0].clientX; y0 = e.touches[0].clientY; }, { passive: true });
+  g.addEventListener('touchend', e => {
+    if (x0 === null) return;
+    const dx = e.changedTouches[0].clientX - x0, dy = e.changedTouches[0].clientY - y0;
+    if (Math.abs(dx) > 45 && Math.abs(dx) > Math.abs(dy) * 1.5) detailView.galleryGo(dx < 0 ? 1 : -1);
+    x0 = null;
+  }, { passive: true });
+})();
+// Tap the photo (or the "Vollbild" pill) → full-size lightbox at the current photo
+$id('detail-gallery').addEventListener('click', e => {
+  if (e.target.closest('.detail-gallery-arrow, .detail-gallery-thumbs')) return;
+  if (detailView.imgs.length) lb.open(detailView.imgs, detailView.idx);
+});
+$id('detail-gallery-prev').onclick = () => detailView.galleryGo(-1);
+$id('detail-gallery-next').onclick = () => detailView.galleryGo(1);
+$id('detail-view').addEventListener('click', e => { if (e.target.id === 'detail-view') detailView.close(); });
+
+$id('detail-quick-share').onclick = async () => {
+  if (!detailView.listing) return;
+  const shareUrl   = `${location.origin}${location.pathname}?listing=${detailView.listing.id}`;
+  const shareTitle = detailView.listing.title || 'Inserat';
+  const priceStr   = detailView.listing.price_cold || detailView.listing.price || '';
+  const shareText  = priceStr ? `${shareTitle} – ${priceStr}` : shareTitle;
+
+  if (navigator.share) {
+    try {
+      await navigator.share({ title: shareTitle, text: shareText, url: shareUrl });
+    } catch (e) { /* user cancelled the native share sheet — nothing to do */ }
+  } else {
+    try {
+      await navigator.clipboard.writeText(shareUrl);
+      toast('🔗 Link kopiert!');
+    } catch (e) {
+      toast('❌ Konnte Link nicht kopieren');
+    }
+  }
+};
+
+$id('detail-btn-like').onclick = () => {
+  if (detailView.listing) { doSwipe(detailView.listing, 'like'); detailView.close(); }
+};
+$id('detail-btn-dislike').onclick = () => {
+  if (detailView.listing) { doSwipe(detailView.listing, 'dislike'); detailView.close(); }
+};
+$id('detail-btn-superlike').onclick = () => {
+  if (detailView.listing) { doSwipe(detailView.listing, 'superlike'); detailView.close(); }
+};
+$id('detail-btn-skip').onclick = () => {
+  if (detailView.listing) { doSwipe(detailView.listing, 'skip'); detailView.close(); }
+};
+$id('detail-btn-undo').onclick = () => { undoLastSwipe(); detailView.close(); };
+$id('detail-also-on').addEventListener('click', async e => {
+  const btn = e.target.closest('[data-not-dup]');
+  const l = detailView.listing;
+  if (!btn || !l) return;
+  const other = (l.also_on || []).find(a => String(a.id) === btn.dataset.notDup);
+  if (!confirm(`Ist das Inserat auf ${platformName(other?.platform)} eine andere Wohnung? Dann werden die beiden wieder getrennt angezeigt.`)) return;
+  const r = await api(`/api/listings/${l.id}/not-duplicate`, { method: 'POST', body: { otherId: Number(btn.dataset.notDup) } });
+  if (r.error) return toast('❌ ' + r.error);
+  l.also_on = (l.also_on || []).filter(a => String(a.id) !== btn.dataset.notDup);
+  if (!l.also_on.length) l.cluster_id = null;
+  detailView._renderAlsoOn();
+  toast('✓ Getrennt – erscheint jetzt als eigenes Inserat');
+  state.swipeQueue = [];
+  if (detailView.fromSwipe) loadSwipeQueue();
+  detailView.onChange?.();
+});
+document.querySelectorAll('#detail-rate-bar [data-rate]').forEach(btn => btn.addEventListener('click', async () => {
+  const l = detailView.listing, act = btn.dataset.rate;
+  if (!l || l.my_swipe === act) return;
+  const r = await api('/api/listings/swipe', { method: 'POST', body: { listingId: l.id, action: act } });
+  if (r.error) return toast('❌ ' + r.error);
+  l.my_swipe = act;
+  detailView._renderRating();
+  toast({ like: '💚 Like gesetzt', superlike: '⭐ Super-Like gesetzt', dislike: '❌ Abgelehnt' }[act]);
+  state.swipeQueue = [];
+  detailView.onChange?.();          // refresh the list / group results behind the detail view
+}));
+
+$id('detail-report-btn').onclick = async () => {
+  const listing = detailView.listing;
+  if (!listing) return;
+  if (!confirm(`„${listing.title}" als offline melden?\n\nDas Inserat wird ins Archiv verschoben. Falls es über einen Suchagenten kam, wird dieser direkt neu durchsucht, um weitere nicht mehr verfügbare Inserate aufzuräumen.`)) return;
+  const r = await api(`/api/listings/${listing.id}/report-offline`, { method: 'POST' });
+  if (r.success) {
+    toast(r.jobTriggered ? '🚫 Gemeldet – Suchagent wird neu durchsucht' : '🚫 Als offline gemeldet');
+    state.swipeQueue = state.swipeQueue.filter(l => l.id !== listing.id);
+    detailView.close();
+    // Refresh whatever view is currently active so the listing disappears
+    const active = document.querySelector('.view.active')?.id;
+    if (active === 'view-swipe')  renderStack();
+    if (active === 'view-rated')  loadRated();
+    if (active === 'view-add')    loadMyAddedListings?.();
+  } else {
+    toast('❌ ' + (r.error || 'Fehler'));
+  }
+};
+
+$id('detail-msg-btn').onclick = () => {
+  if (detailView.listing) messageModal.open(detailView.listing, { groupId: detailView.groupId || null });
+};
+
+// ══════════════════════════════════════════════════════════
+//  CARD BUILDERS
+// ══════════════════════════════════════════════════════════
+function buildSwipeCard(listing) {
+  const images = parseImages(listing);
+  const hasImg = images[0]?.startsWith('http');
+  const tags   = parseTags(listing.tags_json).slice(0, 6);
+
+  const card = document.createElement('div');
+  card.className = 'swipe-card';
+  card.dataset.id = listing.id;
+
+  const statusBadge = listing.status === 'reserved'
+    ? `<div class="card-status-badge status-reserved">Reserviert</div>` : '';
+
+  const cold  = (listing.price_cold || '').trim();
+  const total = (listing.price      || '').trim();
+  const mainPrice = cold || total;
+  const priceSub  = cold ? `kalt${total && total !== cold ? ` · ${esc(total)} warm` : ''}` : '';
+  const facts = [
+    listing.size  ? `<span class="card-fact">${icon('area', 'sm')}${esc(listing.size)}</span>` : '',
+    listing.rooms ? `<span class="card-fact">${icon('door', 'sm')}${esc(listing.rooms)} Zi.</span>` : '',
+  ].join('');
+  const shownTags = tags.slice(0, 3);
+
+  card.innerHTML = `
+    <div class="card-img-area" ${hasImg ? `style="${phStyle(images[0])}"` : ''}>
+      ${hasImg
+        ? `<img class="card-image" src="${esc(images[0])}" onerror="this.style.display='none'" />`
+        : `<div class="card-image-placeholder">${icon('image', 'lg')}</div>`}
+      <span class="card-platform">${esc(platformBadge(listing))}</span>
+      ${statusBadge}
+      ${hasImg ? `<button class="card-photo-btn" data-gallery type="button" aria-label="${images.length > 1 ? `Alle ${images.length} Fotos ansehen` : 'Foto im Vollbild ansehen'}">${icon('expand', 'sm')}${images.length > 1 ? images.length : ''}</button>` : ''}
+      ${mainPrice ? `<div class="card-price-over"><b>${esc(mainPrice)}</b>${priceSub ? `<span>${priceSub}</span>` : ''}</div>` : ''}
+    </div>
+    <div class="card-overlay-badge badge-like">JA</div>
+    <div class="card-overlay-badge badge-dislike">NEIN</div>
+    <div class="card-overlay-badge badge-superlike">SUPER</div>
+    <div class="card-body">
+      <div class="card-title">${esc(listing.title || 'Inserat')}</div>
+      ${listing.location ? `<div class="card-loc">${icon('pin', 'sm')}<span>${esc(listing.location)}</span></div>` : ''}
+      ${facts ? `<div class="card-facts">${facts}</div>` : ''}
+      ${shownTags.length ? `<div class="card-tags">${shownTags.map(t=>`<span class="card-tag">${esc(t)}</span>`).join('')}</div>` : ''}
+      <button class="card-link" data-open-detail type="button">Details ${icon('next', 'sm')}</button>
+    </div>`;
+
+  card.querySelector('[data-gallery]')?.addEventListener('click', e => {
+    e.stopPropagation(); lb.open(images, 0);
+  });
+  card.querySelector('[data-open-detail]')?.addEventListener('click', e => {
+    e.stopPropagation(); detailView.open(listing, { fromSwipe: true });
+  });
+  return card;
+}
+
+// ── Shared card-menu item builders ─────────────────────────
+// Both the list-card menu (Bewertet/Meine Inserate) and the group-results
+// menu render the same "common actions" (contact toggle, report offline).
+// Defining each entry's markup ONCE here means a new shared menu item only
+// has to be added in a single place, instead of being copied into every
+// menu template (which is how the report-offline button previously got
+// forgotten in the group view).
+//
+// The two menus are wired differently — the list-card menu uses per-button
+// listeners keyed on data-menu-action, the group menu uses event delegation
+// keyed on dedicated data-* attributes — so the builder takes a `ctx`
+// ('list' | 'group') and emits exactly the attribute set that context's
+// existing handler already listens for. Adding a shared item = editing this
+// one function.
+function sharedCardMenuHtml(id, contacted, ctx) {
+  const contactLabel = contactMenuLabel(contacted);
+  if (ctx === 'group') {
+    return [
+      `<button data-prepare-message data-listing="${id}">${withIcon('chat', 'Nachricht vorbereiten')}</button>`,
+      `<button data-contact-toggle data-listing="${id}">${contactLabel}</button>`,
+      `<button data-report-offline data-listing="${id}">${withIcon('flag', 'Als offline melden')}</button>`,
+    ].join('\n');
+  }
+  // ctx === 'list'
+  return [
+    `<button data-menu-action="prepare-message">${withIcon('chat', 'Nachricht vorbereiten')}</button>`,
+    `<button data-menu-action="contact-toggle">${contactLabel}</button>`,
+    `<button data-menu-action="report-offline">${withIcon('flag', 'Als offline melden')}</button>`,
+  ].join('\n');
+}
+
+function buildListCard(listing, opts = {}) {
+  const images = parseImages(listing);
+  const hasImg = images[0]?.startsWith('http');
+  const tags   = parseTags(listing.tags_json).slice(0, 4);
+  const cold   = (listing.price_cold || '').trim();
+  const total  = (listing.price      || '').trim();
+  const swipe  = listing.my_swipe;
+    const cardUid = `lc_${listing.id}_${Math.random().toString(36).slice(2,7)}`;
+
+  // Only the person who manually added a listing (no search-agent source) can
+  // change its visibility from the card menu.
+  const canChangeVisibility = !listing.source_job_id && listing.added_by === state.user?.userId;
+  const visLabel = { global:'Alle', private:'Nur ich', group:'Gruppe' }[listing.visibility || 'global'];
+
+  const div = document.createElement('div');
+  div.className = 'list-card' + (opts.selectable ? ' list-card-selectable' : '') + ' rc';
+  div.dataset.listingId = listing.id;
+  if (opts.groupId) div.dataset.groupId = opts.groupId;
+
+  // Shared pieces (same data-* hooks for both card layouts)
+  const menuHtml = `
+    <div class="card-menu" data-menu style="display:none">
+      ${!opts.isArchive ? `
+      <div class="card-menu-section-label">Bewertung ändern</div>
+      <button data-menu-action="rate:like">${withIcon('heart', 'Like')}</button>
+      <button data-menu-action="rate:superlike">${withIcon('star', 'Super-Like')}</button>
+      <button data-menu-action="rate:dislike">${withIcon('x', 'Nein')}</button>
+      <button data-menu-action="unswipe">${withIcon('undo', 'Zurückziehen')}</button>
+      <div class="card-menu-divider"></div>` : ''}
+      ${!opts.isArchive
+        ? sharedCardMenuHtml(listing.id, listing.contacted, 'list')
+        : `<button data-menu-action="contact-toggle">${contactMenuLabel(listing.contacted)}</button>`}
+      ${canChangeVisibility ? `
+      <div class="card-menu-divider"></div>
+      <div class="card-menu-section-label">Sichtbarkeit (${esc(visLabel)})</div>
+      <button data-vis-action="global">${withIcon('globe', 'Alle Nutzer')}</button>
+      <button data-vis-action="private">${withIcon('lock', 'Nur ich')}</button>
+      <button data-vis-action="group">${withIcon('users', 'Gruppe wählen…')}</button>
+      ` : ''}
+    </div>
+    ${canChangeVisibility ? `
+    <div class="vis-group-picker" data-vis-group-picker style="display:none">
+      <select data-vis-group-select>
+        <option value="">Gruppe wählen…</option>
+      </select>
+      <button data-vis-group-confirm>OK</button>
+    </div>` : ''}`;
+  const noteHtml = `
+      <div class="contact-note-wrap" data-note-wrap>
+        <textarea class="contact-note" placeholder="Notiz (optional): Wann kontaktiert, Antwort, etc." data-note-text>${esc(listing.contact_note || '')}</textarea>
+        <div class="contact-note-actions">
+          <button class="contact-note-save" data-note-save>Speichern</button>
+          <button data-note-cancel>Abbrechen</button>
+          <button data-note-unmark class="contact-note-unmark">Markierung entfernen</button>
+        </div>
+      </div>`;
+
+  {
+    // "Meine Bewertungen": one card, laid out as a row on phones and as a
+    // vertical card (price on the photo) on wider screens – see .rc in style.css.
+    const rate = { like: ['heart', 'Like'], superlike: ['star', 'Super-Like'], dislike: ['x', 'Nein'] }[swipe];
+    const contactedText = 'Angeschrieben' + (listing.contact_note ? ' · ' + listing.contact_note.substring(0, 40) : '');
+    div.classList.toggle('rc-dim', swipe === 'dislike');
+    div.dataset.rate = swipe || '';
+    div.innerHTML = `
+      ${opts.selectable ? `<label class="rated-select-wrap rc-check" title="Inserat auswählen"><input type="checkbox" class="rated-select" data-listing-id="${listing.id}" ${state.ratedSelected.has(Number(listing.id)) ? 'checked' : ''}><span>${icon('check', 'sm')}</span></label>` : ''}
+      <div class="list-card-img-area rc-ph"${hasImg ? ` style="${phStyle(images[0])}"` : ''}>
+        ${hasImg
+          ? `<img class="list-card-img" src="${esc(images[0])}" loading="lazy" onerror="this.style.display='none'" />`
+          : `<div class="list-card-img-placeholder">${icon('image', 'lg')}</div>`}
+        ${rate ? `<span class="rc-rate ${swipe}">${icon(rate[0], 'sm')}<span class="rc-rate-label">${rate[1]}</span></span>` : ''}
+        ${listing.status === 'offline'  ? `<span class="rc-strip">Offline</span>` : ''}
+        ${listing.status === 'reserved' ? `<span class="rc-strip res">Reserviert</span>` : ''}
+        <div class="rc-price-over">${(cold || total) ? `<b>${esc(cold || total)}</b><span>${cold ? 'kalt' + (total && total !== cold ? ` · ${esc(total)} warm` : '') : ''}</span>` : ''}</div>
+      </div>
+      <button class="card-menu-btn" data-menu-toggle title="Optionen" aria-label="Optionen">${icon('dots')}</button>
+      ${menuHtml}
+      <div class="list-card-body rc-body">
+        <div class="list-card-title">${esc(listing.title || 'Inserat')}</div>
+        <div class="rc-price">${(cold || total) ? `<b>${esc(cold || total)}</b><span>${cold ? 'kalt' + (total && total !== cold ? ` · ${esc(total)} warm` : '') : ''}</span>` : ''}</div>
+        ${listing.location ? `<div class="rc-loc">${icon('pin', 'sm')}<span>${esc(listing.location)}</span></div>` : ''}
+        <div class="rc-facts">
+          ${listing.size  ? `<span class="rc-chip">${esc(listing.size)}</span>` : ''}
+          ${listing.rooms ? `<span class="rc-chip">${esc(listing.rooms)} Zi.</span>` : ''}
+          ${listing.also_on?.length ? `<span class="rc-chip" title="${esc(listing.also_on.map(a => platformName(a.platform)).join(', '))}">${icon('copy', 'sm')}+${listing.also_on.length} Portal${listing.also_on.length > 1 ? 'e' : ''}</span>` : ''}
+          ${listing.status === 'reserved' ? `<span class="rc-chip warn">Reserviert</span>` : ''}
+          ${listing.status === 'offline'  ? `<span class="rc-chip bad">Nicht mehr verfügbar</span>` : ''}
+          <span class="contacted-badge rc-chip like" ${listing.contacted ? '' : 'hidden'}>${esc(contactedText)}</span>
+        </div>
+        ${opts.votes?.length ? `<div class="vote-chips">${opts.votes.map(v => `<span class="vote-chip ${v.action}">${esc(v.username)} ${icon(v.action === 'like' ? 'heart' : v.action === 'superlike' ? 'star' : 'x', 'sm')}</span>`).join('')}</div>` : ''}
+        ${opts.matchInfo ? `<div class="match-count" style="font-size:.76rem;color:var(--like);margin-bottom:5px">${esc(opts.matchInfo)}</div>` : ''}
+        <div class="rc-foot">
+          <button type="button" class="rc-btn primary" data-rc="message">${icon('chat', 'sm')}Nachricht</button>
+          <button type="button" class="rc-btn" data-open-detail>Details</button>
+          <button type="button" class="rc-btn rc-contact" data-rc="contact">${icon('mail', 'sm')}<span>${listing.contacted ? 'Notiz' : 'Als angeschrieben'}</span></button>
+        </div>
+        ${noteHtml}
+      </div>`;
+  }
+
+  if (opts.selectable) {
+    const cb = div.querySelector('.rated-select');
+    cb?.addEventListener('click', e => e.stopPropagation());
+    cb?.addEventListener('change', () => {
+      const id = Number(cb.dataset.listingId);
+      if (cb.checked) state.ratedSelected.add(id); else state.ratedSelected.delete(id);
+      updateRatedBulkButtons();
+    });
+  }
+
+  {
+    // Tap anywhere on the card (except its controls) → detail view; footer shortcuts reuse the menu actions.
+    div.addEventListener('click', e => {
+      if (e.target.closest('button, a, label, input, textarea, select, [data-menu], [data-note-wrap], [data-vis-group-picker]')) return;
+      detailView.open(listing, { groupId: opts.groupId || null, onChange: opts.onChange, isArchive: opts.isArchive });
+    });
+    div.querySelector('[data-rc="message"]')?.addEventListener('click', e => { e.stopPropagation(); messageModal.open(listing, { groupId: opts.groupId || null }); });
+    div.querySelector('[data-rc="contact"]')?.addEventListener('click', e => { e.stopPropagation(); div.querySelector('[data-menu-action="contact-toggle"]')?.click(); });
+  }
+
+  div.querySelector('[data-open-detail]')?.addEventListener('click', e => {
+    e.stopPropagation(); detailView.open(listing, { groupId: opts.groupId || null, onChange: opts.onChange, isArchive: opts.isArchive });
+  });
+
+  // ── Three-dot menu wiring ──
+  const menuBtn  = div.querySelector('[data-menu-toggle]');
+  const menu     = div.querySelector('[data-menu]');
+  const noteWrap = div.querySelector('[data-note-wrap]');
+  const noteText = div.querySelector('[data-note-text]');
+
+  menuBtn.addEventListener('click', e => {
+    e.stopPropagation();
+    closeAllCardMenus(menu);
+    const willOpen = menu.style.display === 'none';
+    menu.style.display = willOpen ? 'flex' : 'none';
+    div.classList.toggle('menu-open', willOpen);
+    if (willOpen) positionMenuNearButton(menu, menuBtn);
+  });
+
+  menu.querySelectorAll('[data-menu-action]').forEach(btn => {
+    btn.addEventListener('click', async e => {
+      e.stopPropagation();
+      menu.style.display = 'none';
+      div.classList.remove('menu-open');
+      const action = btn.dataset.menuAction;
+
+      if (action.startsWith('rate:')) {
+        const act = action.slice(5);
+        await api('/api/listings/swipe', { method: 'POST', body: { listingId: listing.id, action: act } });
+        toast({ like: '💚 Like gesetzt', superlike: '⭐ Super-Like gesetzt', dislike: '❌ Abgelehnt' }[act]);
+        state.swipeQueue = [];
+        if (opts.onChange) opts.onChange();
+      } else if (action === 'unswipe') {
+        const r = await api(`/api/listings/swipe/${listing.id}`, { method: 'DELETE' });
+        if (r.success) {
+          toast('↩ Bewertung zurückgezogen');
+          state.swipeQueue = [];
+          if (opts.onChange) opts.onChange();
+          else { div.style.opacity = '0'; div.style.transition = 'opacity .3s'; setTimeout(() => div.remove(), 280); }
+        }
+      } else if (action === 'contact-toggle') {
+        if (!listing.contacted) {
+          const r = await api('/api/contacts', { method: 'POST', body: {
+            listingId: listing.id, groupId: opts.groupId || null, note: '',
+          }});
+          if (r.success) {
+            listing.contacted = true;
+            toast('📬 Als angeschrieben markiert');
+            noteWrap.classList.add('open');
+            btn.innerHTML = contactMenuLabel(true);
+            div.querySelector('.contacted-badge')?.removeAttribute('hidden');
+            const rcSpan = div.querySelector('.rc-contact span'); if (rcSpan) rcSpan.textContent = 'Notiz';
+            // Insert contacted badge if not already present
+            if (!div.querySelector('.contacted-badge')) {
+              const badge = document.createElement('div');
+              badge.className = 'contacted-badge';
+              badge.textContent = 'Angeschrieben';
+              div.querySelector('.swipe-badge')?.insertAdjacentElement('afterend', badge)
+                ?? div.querySelector('.list-card-link').insertAdjacentElement('beforebegin', badge);
+            }
+          }
+        } else {
+          noteWrap.classList.toggle('open');
+        }
+      } else if (action === 'report-offline') {
+        if (!confirm(`„${listing.title}" als offline melden?\n\nDas Inserat wird ins Archiv verschoben. Falls es über einen Suchagenten kam, wird dieser direkt neu durchsucht, um weitere nicht mehr verfügbare Inserate aufzuräumen.`)) return;
+        const r = await api(`/api/listings/${listing.id}/report-offline`, { method: 'POST' });
+        if (r.success) {
+          div.style.opacity = '0'; div.style.transition = 'opacity .3s';
+          setTimeout(() => { div.remove(); opts.onChange?.(); }, 280);
+          toast(r.jobTriggered ? '🚫 Gemeldet – Suchagent wird neu durchsucht' : '🚫 Als offline gemeldet');
+          state.swipeQueue = [];
+        } else {
+          toast('❌ ' + (r.error || 'Fehler'));
+        }
+      } else if (action === 'prepare-message') {
+        messageModal.open(listing, { groupId: opts.groupId || null });
+      }
+    });
+  });
+
+  // ── Visibility change wiring (only present for own manually-added listings) ──
+  if (canChangeVisibility) {
+    const groupPicker = div.querySelector('[data-vis-group-picker]');
+    const groupSelect  = div.querySelector('[data-vis-group-select]');
+
+    div.querySelectorAll('[data-vis-action]').forEach(btn => {
+      btn.addEventListener('click', async e => {
+        e.stopPropagation();
+        const choice = btn.dataset.visAction;
+        if (choice === 'group') {
+          // Populate group options then show the inline picker instead of saving immediately
+          menu.style.display = 'none';
+          div.classList.remove('menu-open');
+          while (groupSelect.options.length > 1) groupSelect.remove(1);
+          state.groups.forEach(g => {
+            const o = document.createElement('option');
+            o.value = g.id; o.textContent = g.name;
+            if (listing.visibility_id == g.id) o.selected = true;
+            groupSelect.appendChild(o);
+          });
+          groupPicker.style.display = 'flex';
+          positionMenuNearButton(groupPicker, menuBtn);
+          return;
+        }
+        // global / private → save immediately
+        menu.style.display = 'none';
+        div.classList.remove('menu-open');
+        const r = await api(`/api/listings/${listing.id}/visibility`, {
+          method: 'PATCH', body: { visibility: choice, visibility_id: null },
+        });
+        if (r.success) {
+          listing.visibility = r.visibility;
+          listing.visibility_id = r.visibility_id;
+          const label = { global:'Alle Nutzer', private:'Nur ich' }[choice];
+          toast(`✓ Sichtbarkeit: ${label}`);
+          const secLabel = div.querySelector('.card-menu-section-label');
+          if (secLabel) secLabel.textContent = `Sichtbarkeit (${label})`;
+        } else {
+          toast('❌ ' + (r.error || 'Fehler'));
+        }
+      });
+    });
+
+    div.querySelector('[data-vis-group-confirm]')?.addEventListener('click', async e => {
+      e.stopPropagation();
+      const gid = groupSelect.value;
+      if (!gid) { toast('⚠️ Bitte eine Gruppe wählen'); return; }
+      const r = await api(`/api/listings/${listing.id}/visibility`, {
+        method: 'PATCH', body: { visibility: 'group', visibility_id: gid },
+      });
+      groupPicker.style.display = 'none';
+      if (r.success) {
+        listing.visibility = 'group';
+        listing.visibility_id = gid;
+        const groupName = state.groups.find(g => g.id == gid)?.name || 'Gruppe';
+        toast(`✓ Sichtbarkeit: Gruppe ${groupName}`);
+        const secLabel = div.querySelector('.card-menu-section-label');
+        if (secLabel) secLabel.textContent = `Sichtbarkeit (Gruppe ${groupName})`;
+      } else {
+        toast('❌ ' + (r.error || 'Fehler'));
+      }
+    });
+  }
+
+  div.querySelector('[data-note-save]')?.addEventListener('click', async () => {
+    await api(`/api/contacts/${listing.id}`, { method: 'PATCH', body: {
+      note: noteText?.value || '', groupId: opts.groupId || null,
+    }});
+    noteWrap.classList.remove('open');
+    toast('✓ Notiz gespeichert');
+    const badge = div.querySelector('.contacted-badge');
+    if (badge) badge.textContent = 'Angeschrieben' + (noteText.value ? ' · ' + noteText.value.substring(0,40) : '');
+  });
+  div.querySelector('[data-note-cancel]')?.addEventListener('click', () => noteWrap.classList.remove('open'));
+  div.querySelector('[data-note-unmark]')?.addEventListener('click', async () => {
+    const r = await contactApi.unmark(listing.id, opts.groupId || null);
+    if (!r.success) { toast('❌ ' + (r.error || 'Fehler')); return; }
+    listing.contacted = false; listing.contact_note = '';
+    applyContactToCards(listing.id, opts.groupId || null, false);
+    toast('Markierung entfernt');
+  });
+
+  // Archive timestamp
+  if (opts.isArchive && listing.archived_at) {
+    const ts = document.createElement('div');
+    ts.className = 'archive-ts';
+    const d = new Date(listing.archived_at + 'Z');
+    ts.innerHTML = `${icon('archive', 'sm')}Archiviert ${d.toLocaleDateString('de-DE', { day:'2-digit', month:'2-digit', year:'numeric' })}`;
+    div.querySelector('.list-card-body')?.prepend(ts);
+  }
+
+  return div;
+}
+
+// Close all open card menus except the one passed in (or all if omitted)
+// Position a dropdown menu so it always stays fully within the viewport,
+// instead of relying on fixed CSS offsets (right:8px etc.) that only work
+// when there happens to be enough room. Anchors the menu just below the
+// trigger button, clamped so it never runs off the left/right/bottom edge —
+// this matters most on narrow mobile grid cards where a right-anchored menu
+// can easily overflow past the left edge of the screen.
+function positionMenuNearButton(menu, btn) {
+  const margin = 8;
+  const btnRect = btn.getBoundingClientRect();
+
+  // Make sure the menu is measurable (must be visible/display!=none already)
+  const menuRect = menu.getBoundingClientRect();
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+
+  // Default: align menu's right edge with the button's right edge, just below it
+  let left = btnRect.right - menuRect.width;
+  let top  = btnRect.bottom + 6;
+
+  // Clamp horizontally so it never runs off either edge of the screen
+  if (left < margin) left = margin;
+  if (left + menuRect.width > vw - margin) left = Math.max(margin, vw - menuRect.width - margin);
+
+  // If there isn't room below, flip above the button instead
+  if (top + menuRect.height > vh - margin) {
+    const above = btnRect.top - menuRect.height - 6;
+    top = above > margin ? above : margin;
+  }
+
+  menu.style.position = 'fixed';
+  menu.style.left     = `${left}px`;
+  menu.style.top      = `${top}px`;
+  menu.style.right    = 'auto';
+}
+
+function closeAllCardMenus(except = null) {
+  document.querySelectorAll('.card-menu').forEach(m => {
+    if (m !== except) {
+      m.style.display = 'none';
+      m.closest('.list-card')?.classList.remove('menu-open');
+    }
+  });
+  document.querySelectorAll('.vis-group-picker').forEach(p => p.style.display = 'none');
+}
+document.addEventListener('click', e => {
+  if (!e.target.closest('[data-menu-toggle]') && !e.target.closest('[data-menu]') && !e.target.closest('.vis-group-picker')) {
+    closeAllCardMenus();
+  }
+});
+
+// ══════════════════════════════════════════════════════════
+//  SWIPE ENGINE
+// ══════════════════════════════════════════════════════════
+async function loadSwipeQueue() {
+  const d = await api('/api/listings/swipe');
+  state.swipeQueue = d.listings || [];
+  updateUndoButton();
+  // Show badge on tab if there are unswiped listings
+  updateSwipeBadge(state.swipeQueue.length);
+  renderStack();
+  prefetchUpcomingImages();
+}
+
+// ── Bounded-concurrency image prefetcher ───────────────────
+// On a slow/flaky connection, swiping stutters because the next card's
+// photos only start downloading the moment it becomes visible. This warms
+// the browser cache for the FIRST image of the next few queued listings in
+// the background, but caps how many download at once so we never saturate a
+// weak connection (which would make the *current* card's gallery load even
+// slower). Fire-and-forget: failures are ignored, already-cached images
+// resolve instantly, and the set of fetched URLs is remembered so we never
+// re-request the same image.
+const PREFETCH_AHEAD       = 5;   // how many upcoming listings to warm
+const PREFETCH_CONCURRENCY = 2;   // max simultaneous downloads
+const _prefetchedUrls = new Set();
+
+function prefetchUpcomingImages() {
+  // Collect the first image of the next PREFETCH_AHEAD listings (skipping
+  // the top card, whose image is loading anyway), de-duplicated.
+  const urls = [];
+  for (const listing of state.swipeQueue.slice(1, 1 + PREFETCH_AHEAD)) {
+    const imgs = parseImages(listing);
+    const first = imgs[0];
+    if (first && first.startsWith('http') && !_prefetchedUrls.has(first)) {
+      _prefetchedUrls.add(first);
+      urls.push(first);
+    }
+  }
+  if (!urls.length) return;
+
+  // Simple worker-pool: PREFETCH_CONCURRENCY workers pull from the queue.
+  let idx = 0;
+  const worker = async () => {
+    while (idx < urls.length) {
+      const myIdx = idx++;
+      if (myIdx >= urls.length) break;
+      await new Promise(resolve => {
+        const img = new Image();
+        img.onload = img.onerror = () => resolve();
+        img.src = urls[myIdx];
+      });
+    }
+  };
+  for (let w = 0; w < PREFETCH_CONCURRENCY; w++) worker();
+}
+
+function updateSwipeBadge(count) {
+  const tab = document.querySelector('.tab-nav[data-view="swipe"]');
+  if (!tab) return;
+  let badge = tab.querySelector('.tab-badge');
+  if (count > 0) {
+    if (!badge) {
+      badge = document.createElement('span');
+      badge.className = 'tab-badge';
+      tab.querySelector('.tab-icon').appendChild(badge);
+    }
+    badge.textContent = count > 99 ? '99+' : count;
+  } else if (badge) {
+    badge.remove();
+  }
+}
+
+// Wide screens (≥1100px) on the swipe page: the detail panel is docked next to the card stack
+// and always shows the top card; everywhere else it is the modal in #detail-view.
+const DOCK_MIN_WIDTH = 1100;
+function syncDetailMount() {
+  const inner = document.querySelector('.detail-view-inner');
+  const host = $id('swipe-quick'), overlay = $id('detail-view');
+  if (!inner || !host) return;
+  const want = window.innerWidth >= DOCK_MIN_WIDTH && $id('view-swipe').classList.contains('active')
+               && overlay.style.display === 'none' && !!state.user;
+  if (want) {
+    if (inner.parentElement !== host) host.appendChild(inner);
+    inner.classList.add('embedded');
+    const top = state.swipeQueue[0];
+    host.classList.toggle('empty', !top);
+    if (top && !(detailView.embedded && detailView.listing?.id === top.id)) detailView.embed(top);
+    if (!top) { detailView._contact?.destroy(); detailView._contact = null; detailView.listing = null; }
+  } else if (inner.parentElement === host) {
+    detailView._contact?.destroy(); detailView._contact = null;
+    overlay.appendChild(inner); inner.classList.remove('embedded');
+    detailView.embedded = false; detailView.listing = null;
+  }
+}
+let _dockTimer = null;
+window.addEventListener('resize', () => { clearTimeout(_dockTimer); _dockTimer = setTimeout(syncDetailMount, 150); });
+
+function renderStack() {
+  const stack   = $id('card-stack');
+  const actions = $id('swipe-actions');
+  const empty   = $id('empty-swipe');
+  $id('remaining-count').textContent = state.swipeQueue.length;
+
+  if (!state.swipeQueue.length) {
+    stack.querySelectorAll('.swipe-card').forEach(c => c.remove());
+    empty.style.display = ''; actions.style.display = 'none'; syncDetailMount(); return;
+  }
+  syncDetailMount();
+  empty.style.display = 'none'; actions.style.display = 'flex';
+
+  const top3 = state.swipeQueue.slice(0, 3);
+
+  // Which IDs are currently in the DOM?
+  const domCards = Array.from(stack.querySelectorAll('.swipe-card'));
+  const domIds   = new Set(domCards.map(c => parseInt(c.dataset.id)));
+  const queueIds = new Set(top3.map(l => l.id));
+
+  // Remove cards no longer in top-3; cards that stay get their portal badge refreshed (copies may have changed)
+  domCards.forEach(c => {
+    const id = parseInt(c.dataset.id);
+    if (!queueIds.has(id)) return c.remove();
+    const badge = c.querySelector('.card-platform');
+    if (badge) badge.textContent = platformBadge(top3.find(l => l.id === id));
+  });
+
+  // Add missing cards (pre-rendered, initially invisible at back position)
+  top3.forEach((listing, idx) => {
+    if (!domIds.has(listing.id)) {
+      const card = buildSwipeCard(listing);
+      // Start from back position so it animates into place
+      card.style.opacity = '0';
+      card.style.transform = 'scale(0.88) translateY(28px)';
+      stack.appendChild(card);
+    }
+  });
+
+  // Now assign correct position classes with a clean transition
+  // Use requestAnimationFrame to ensure DOM is updated before adding transitions
+  requestAnimationFrame(() => {
+    const cards = Array.from(stack.querySelectorAll('.swipe-card:not(.fly-left):not(.fly-right):not(.fly-up):not(.fly-down)'));
+
+    // Sort cards so top of queue = last in DOM (highest z-index via position)
+    // card at index 0 in queue = card-top, index 1 = card-behind-1, etc.
+    top3.forEach((listing, qIdx) => {
+      const card = stack.querySelector(`.swipe-card[data-id="${listing.id}"]:not(.fly-left):not(.fly-right):not(.fly-up):not(.fly-down)`);
+      if (!card) return;
+
+      const wasTop = card.classList.contains('card-top');
+      card.classList.remove('card-top', 'card-behind-1', 'card-behind-2');
+
+      if (qIdx === 0) {
+        // This is the new top card
+        card.style.transition = 'transform 0.32s cubic-bezier(.16,1,.3,1), opacity 0.32s ease';
+        card.style.transform  = '';
+        card.style.opacity    = '';
+        card.classList.add('card-top');
+        // Only attach drag if it's newly becoming top
+        if (!wasTop) {
+          // Small delay so the promote animation starts first
+          setTimeout(() => attachDrag(card, listing), 50);
+        } else {
+          attachDrag(card, listing);
+        }
+      } else if (qIdx === 1) {
+        card.style.transition = 'transform 0.32s cubic-bezier(.16,1,.3,1), opacity 0.32s ease';
+        card.style.transform  = '';
+        card.style.opacity    = '';
+        card.classList.add('card-behind-1');
+      } else {
+        card.style.transition = 'transform 0.32s cubic-bezier(.16,1,.3,1), opacity 0.32s ease';
+        card.style.transform  = '';
+        card.style.opacity    = '';
+        card.classList.add('card-behind-2');
+      }
+    });
+  });
+}
+
+// Global drag state – one active drag at a time
+let _dragCard     = null;
+let _dragCleanup  = null;
+
+function attachDrag(card, listing) {
+  // Don't re-attach if this card is already the active drag target
+  if (_dragCard === card) return;
+
+  // Clean up previous drag
+  if (_dragCleanup) { _dragCleanup(); _dragCleanup = null; }
+  _dragCard = card;
+
+  let sx = 0, sy = 0, cx = 0, cy = 0, dragging = false;
+  const bl = card.querySelector('.badge-like');
+  const bd = card.querySelector('.badge-dislike');
+  const bs = card.querySelector('.badge-superlike');
+
+  function start(x, y) {
+    // Ignore if another card is flying
+    if (document.querySelector('.fly-left, .fly-right, .fly-up, .fly-down')) return;
+    sx = x; sy = y; cx = x; cy = y; dragging = true;
+    card.style.transition = 'none';
+    card.style.zIndex     = '10';
+  }
+
+  function move(x, y) {
+    if (!dragging) return;
+    cx = x; cy = y;
+    const dx = cx - sx, dy = cy - sy;
+    card.style.transform = `translate(${dx}px,${dy}px) rotate(${dx * 0.06}deg)`;
+    if (dy < -80 && Math.abs(dx) < 80) {
+      bs.style.opacity = Math.min(1, Math.abs(dy) / 100);
+      bl.style.opacity = bd.style.opacity = 0;
+    } else if (dx > 60) {
+      bl.style.opacity = Math.min(1, dx / 100);
+      bd.style.opacity = bs.style.opacity = 0;
+    } else if (dx < -60) {
+      bd.style.opacity = Math.min(1, Math.abs(dx) / 100);
+      bl.style.opacity = bs.style.opacity = 0;
+    } else {
+      bl.style.opacity = bd.style.opacity = bs.style.opacity = 0;
+    }
+  }
+
+  function end() {
+    if (!dragging) return;
+    dragging = false;
+    bl.style.opacity = bd.style.opacity = bs.style.opacity = 0;
+    const dx = cx - sx, dy = cy - sy;
+    const dist = Math.max(Math.abs(dx), Math.abs(dy));
+    if      (dy < -100 && Math.abs(dx) < 100) doSwipe(listing, 'superlike');
+    else if (dx >  100)                        doSwipe(listing, 'like');
+    else if (dx < -100)                        doSwipe(listing, 'dislike');
+    else {
+      card.style.transition = 'transform 0.35s cubic-bezier(.16,1,.3,1)';
+      card.style.transform  = '';
+      card.style.zIndex     = '';
+      // A clean tap (negligible movement, not an aborted swipe attempt)
+      // opens the full detail view instead of just snapping back.
+      if (dist < 8) detailView.open(listing, { fromSwipe: true });
+    }
+  }
+
+  const onMove = e => move(e.clientX, e.clientY);
+  const onUp   = end;
+
+  const isInteractive = e => !!e.target.closest('[data-gallery], [data-open-detail], a, button');
+
+  card.addEventListener('mousedown',  e => { if (e.button === 0 && !isInteractive(e)) start(e.clientX, e.clientY); });
+  document.addEventListener('mousemove', onMove);
+  document.addEventListener('mouseup',   onUp);
+  card.addEventListener('touchstart', e => { if (isInteractive(e)) return; const t = e.touches[0]; start(t.clientX, t.clientY); }, { passive: true });
+  card.addEventListener('touchmove',  e => { const t = e.touches[0]; move(t.clientX, t.clientY); e.preventDefault(); }, { passive: false });
+  card.addEventListener('touchend',   end);
+
+  _dragCleanup = () => {
+    document.removeEventListener('mousemove', onMove);
+    document.removeEventListener('mouseup',   onUp);
+    _dragCard = null;
+  };
+}
+
+async function doSwipe(listing, action) {
+  const card = $id('card-stack').querySelector(`.swipe-card[data-id="${listing.id}"]`);
+  const isFlying = card && (card.classList.contains('fly-left') || card.classList.contains('fly-right') || card.classList.contains('fly-up') || card.classList.contains('fly-down'));
+  if (isFlying) return;
+
+  const toastMsg = {
+    like:      'Gefällt dir!',
+    dislike:   'Abgelehnt',
+    superlike: 'Super-Like!',
+    skip:      'Übersprungen – kommt später wieder',
+  }[action];
+
+  // Fire API in background
+  api('/api/listings/swipe', { method: 'POST', body: { listingId: listing.id, action } });
+
+  // Track for the undo button (always remembers the most recent swipe in this session)
+  state.lastSwipe = { listing, action };
+  updateUndoButton();
+
+  // No matching card in the stack — this listing was never part of the
+  // active swipe queue (e.g. opened directly via a shared link). Just
+  // record the swipe and confirm with a toast; there's no card to animate.
+  if (!card) { toast(toastMsg); return; }
+
+  // Detach drag immediately
+  if (_dragCleanup) { _dragCleanup(); _dragCleanup = null; }
+
+  // Reset inline styles then trigger fly class
+  card.style.transition = '';
+  card.style.zIndex     = '10';
+
+  // Force reflow so transition picks up the current (possibly translated) position
+  void card.offsetWidth;
+
+  const flyClass = { like: 'fly-right', dislike: 'fly-left', superlike: 'fly-up', skip: 'fly-down' }[action];
+  card.classList.add(flyClass);
+  toast(toastMsg);
+
+  // Remove from queue immediately so renderStack knows what's next.
+  // Skipped listings get pushed to the back of the queue instead of removed entirely,
+  // so they resurface once everything else has been swiped (matches server-side ordering).
+  state.swipeQueue = state.swipeQueue.filter(l => l.id !== listing.id);
+  if (action === 'skip') {
+    state.swipeQueue.push(listing);
+  }
+
+  // Trigger stack update right away – the flying card is still in DOM
+  // renderStack will skip it because it has fly-* class
+  renderStack();
+  prefetchUpcomingImages();
+
+  // Remove the card after animation completes
+  setTimeout(() => { card.remove(); }, 420);
+}
+
+function updateUndoButton() {
+  const btn = $id('btn-undo');
+  if (btn) btn.disabled = !state.lastSwipe;
+  const detailBtn = $id('detail-btn-undo');
+  if (detailBtn) detailBtn.disabled = !state.lastSwipe;
+}
+
+async function undoLastSwipe() {
+  if (!state.lastSwipe) return;
+  const btn = $id('btn-undo');
+  btn.disabled = true;
+
+  const r = await api('/api/listings/swipe/undo-last', { method: 'POST' });
+  if (!r.success) {
+    toast('⚠️ Nichts zum Zurücknehmen');
+    return;
+  }
+
+  const { listing, action } = state.lastSwipe;
+  toast('↩ Zurückgenommen: ' + (listing.title || 'Inserat').substring(0, 40));
+
+  // If it was pushed to the back of the queue as a skip, remove that duplicate
+  if (action === 'skip') {
+    state.swipeQueue = state.swipeQueue.filter(l => l.id !== listing.id);
+  }
+  // Put the listing back at the very front so the user sees it again immediately
+  state.swipeQueue.unshift(r.listing || listing);
+
+  state.lastSwipe = null;
+  updateUndoButton();
+  renderStack();
+}
+
+$id('btn-like').onclick      = () => state.swipeQueue[0] && doSwipe(state.swipeQueue[0], 'like');
+$id('btn-dislike').onclick   = () => state.swipeQueue[0] && doSwipe(state.swipeQueue[0], 'dislike');
+$id('btn-superlike').onclick = () => state.swipeQueue[0] && doSwipe(state.swipeQueue[0], 'superlike');
+$id('btn-skip').onclick      = () => state.swipeQueue[0] && doSwipe(state.swipeQueue[0], 'skip');
+$id('btn-undo').onclick      = () => undoLastSwipe();
+
+document.addEventListener('keydown', e => {
+  if (!state.user) return;
+  if ($id('lightbox').style.display !== 'none') return;
+  if ($id('detail-view').style.display !== 'none') return;
+  if (document.querySelector('.modal[style*="flex"]')) return;
+  if (!$id('view-swipe').classList.contains('active')) return;
+
+  // Undo works even if the queue looks empty (e.g. right after the last card was swiped)
+  if (e.key === 'Backspace' || (e.key.toLowerCase() === 'z' && !e.ctrlKey && !e.metaKey)) {
+    if (state.lastSwipe) { e.preventDefault(); undoLastSwipe(); }
+    return;
+  }
+
+  if (!state.swipeQueue.length) return;
+  if (e.key === 'ArrowLeft')  { e.preventDefault(); doSwipe(state.swipeQueue[0], 'dislike'); }
+  if (e.key === 'ArrowRight') { e.preventDefault(); doSwipe(state.swipeQueue[0], 'like'); }
+  if (e.key === 'ArrowUp')    { e.preventDefault(); doSwipe(state.swipeQueue[0], 'superlike'); }
+  if (e.key === 'ArrowDown')  { e.preventDefault(); doSwipe(state.swipeQueue[0], 'skip'); }
+});
+
+// ══════════════════════════════════════════════════════════
+//  ADD LISTING
+// ══════════════════════════════════════════════════════════
+$id('add-listing-btn').addEventListener('click', async () => {
+  const url        = $id('listing-url').value.trim();
+  const visibility  = $id('add-visibility').value;
+  const visGrp      = $id('add-visibility-group').value;
+  clr('add-error');
+  if (!url.startsWith('http')) return setErr('add-error', 'Bitte eine gültige URL eingeben');
+  if (visibility === 'group' && !visGrp) return setErr('add-error', 'Bitte eine Gruppe wählen');
+  const btnText = $id('add-btn-text'), spinner = $id('add-btn-spinner'), btn = $id('add-listing-btn');
+  btnText.style.display = 'none'; spinner.style.display = 'inline'; btn.disabled = true;
+  const d = await api('/api/listings/add', { method:'POST', body:{
+    url, visibility, visibility_id: visibility === 'group' ? visGrp : null,
+  }});
+  btnText.style.display = 'inline'; spinner.style.display = 'none'; btn.disabled = false;
+  if (d.error) return setErr('add-error', d.error);
+  $id('listing-url').value = '';
+  $id('preview-card').innerHTML = '';
+  $id('preview-card').appendChild(buildListCard(d.listing));
+  $id('add-preview').style.display = '';
+  toast('✅ Inserat hinzugefügt!');
+  state.swipeQueue = [];
+  loadMyAddedListings();
+});
+
+// Show/hide group selector based on visibility choice (manual add page)
+$id('add-visibility').addEventListener('change', () => {
+  const isGroup = $id('add-visibility').value === 'group';
+  $id('add-visibility-group-row').style.display = isGroup ? '' : 'none';
+});
+
+function populateAddGroupSelect() {
+  const sel = $id('add-visibility-group');
+  if (!sel) return;
+  while (sel.options.length > 1) sel.remove(1);
+  state.groups.forEach(g => {
+    const o = document.createElement('option');
+    o.value = g.id; o.textContent = g.name;
+    sel.appendChild(o);
+  });
+}
+
+// History of listings the current user has manually added
+async function loadMyAddedListings() {
+  populateAddGroupSelect();
+  const d = await api('/api/listings/mine');
+  const list  = $id('my-added-list');
+  const empty = $id('my-added-empty');
+  if (!list) return;
+  list.innerHTML = '';
+  const listings = d.listings || [];
+  if (!listings.length) { empty.style.display = ''; return; }
+  empty.style.display = 'none';
+  listings.forEach(l => list.appendChild(buildListCard(l)));
+}
+
+// ══════════════════════════════════════════════════════════
+//  RATED
+// ══════════════════════════════════════════════════════════
+let _ratedAll = [];
+
+async function loadRated() {
+  const d = await api('/api/listings/rated');
+  // The server returns newest rating first; remember that order for "Älteste zuerst".
+  _ratedAll = (d.listings || []).map((l, i) => ({ ...l, _order: i }));
+  state.ratedSelected.clear();
+  renderRated();
+}
+
+// "700 €" / "1.150 €" / "1.150,50 €" → number (Infinity when there is no price, so those sort last)
+function priceNumber(l) {
+  const raw = (l.price_cold || l.price || '').replace(/[^\d.,]/g, '');
+  if (!raw) return Infinity;
+  const n = parseFloat(raw.replace(/\./g, '').replace(',', '.'));
+  return Number.isFinite(n) ? n : Infinity;
+}
+
+function ratedVisible() {
+  const filter = state.ratedFilter;
+  const items = filter === 'all' ? _ratedAll.slice() : _ratedAll.filter(l => l.my_swipe === filter);
+  const sort = state.ratedSort || 'recent';
+  if (sort === 'oldest')          items.sort((a, b) => b._order - a._order);
+  else if (sort === 'price-asc')  items.sort((a, b) => priceNumber(a) - priceNumber(b) || a._order - b._order);
+  else if (sort === 'price-desc') items.sort((a, b) => (priceNumber(b) === Infinity ? -1 : priceNumber(b)) - (priceNumber(a) === Infinity ? -1 : priceNumber(a)) || a._order - b._order);
+  else                            items.sort((a, b) => a._order - b._order);
+  return items;
+}
+
+function updateRatedBulkButtons() {
+  const count = state.ratedSelected.size;
+  const del = $id('rated-delete-selected-btn');
+  const sel = $id('rated-select-all-btn');
+  $id('rated-bulk-count').textContent = `${count} ausgewählt`;
+  if (del) del.disabled = count === 0;
+  if (sel) {
+    const visible = ratedVisible();
+    const all = visible.length > 0 && visible.every(l => state.ratedSelected.has(Number(l.id)));
+    sel.textContent = all ? 'Auswahl aufheben' : 'Alle auswählen';
+    sel.disabled = visible.length === 0;
+  }
+}
+
+function setRatedSelectMode(on) {
+  state.ratedSelectMode = on;
+  $id('view-rated').classList.toggle('select-mode', on);
+  $id('rated-bulk-bar').hidden = !on;
+  document.body.classList.toggle('rated-selecting', on);
+  const t = $id('rated-select-toggle');
+  t.setAttribute('aria-pressed', String(on));
+  if (!on) state.ratedSelected.clear();
+  renderRated();
+}
+
+function renderRated() {
+  const list   = $id('rated-list');
+  const empty  = $id('rated-empty');
+  const items  = ratedVisible();
+  // Counts + subtitle
+  const cnt = { all: _ratedAll.length, like: 0, superlike: 0, dislike: 0 };
+  _ratedAll.forEach(l => { if (cnt[l.my_swipe] !== undefined) cnt[l.my_swipe]++; });
+  document.querySelectorAll('#rated-filter [data-count]').forEach(el => { el.textContent = cnt[el.dataset.count] ?? 0; });
+  $id('rated-sub').textContent = _ratedAll.length ? `${_ratedAll.length} Inserat${_ratedAll.length === 1 ? '' : 'e'} bewertet` : 'Noch nichts bewertet';
+  // Never keep hidden (filtered-out) items selected, so "entfernen" only
+  // ever deletes what the user can currently see ticked.
+  const visibleIds = new Set(items.map(l => Number(l.id)));
+  [...state.ratedSelected].forEach(id => { if (!visibleIds.has(id)) state.ratedSelected.delete(id); });
+  list.innerHTML = '';
+  list.classList.toggle('rated-selecting', !!state.ratedSelectMode);
+  if (!items.length) {
+    empty.style.display = '';
+    empty.querySelector('p').textContent = _ratedAll.length ? 'Keine Bewertungen in diesem Filter.' : 'Keine Bewertungen.';
+    updateRatedBulkButtons(); return;
+  }
+  empty.style.display = 'none';
+  items.forEach(l => list.appendChild(buildListCard(l, { selectable: !!state.ratedSelectMode, rated: true, onChange: () => loadRated() })));
+  updateRatedBulkButtons();
+}
+
+$id('rated-select-toggle').addEventListener('click', () => setRatedSelectMode(!state.ratedSelectMode));
+$id('rated-select-done').addEventListener('click', () => setRatedSelectMode(false));
+$id('rated-sort').addEventListener('change', e => { state.ratedSort = e.target.value; renderRated(); });
+
+$id('rated-select-all-btn').addEventListener('click', () => {
+  const visible = ratedVisible();
+  const all = visible.length > 0 && visible.every(l => state.ratedSelected.has(Number(l.id)));
+  visible.forEach(l => { if (all) state.ratedSelected.delete(Number(l.id)); else state.ratedSelected.add(Number(l.id)); });
+  renderRated();
+});
+
+$id('rated-delete-selected-btn').addEventListener('click', async () => {
+  const ids = [...state.ratedSelected];
+  if (!ids.length) return;
+  if (!confirm(`${ids.length} Bewertung${ids.length === 1 ? '' : 'en'} entfernen? Die Inserate selbst bleiben bestehen und erscheinen beim Swipen wieder.`)) return;
+  const r = await api('/api/listings/rated', { method: 'DELETE', body: { listingIds: ids } });
+  if (!r.success) { toast('❌ ' + (r.error || 'Entfernen fehlgeschlagen')); return; }
+  state.ratedSelected.clear();
+  toast(`🗑 ${r.deleted} Bewertung${r.deleted === 1 ? '' : 'en'} entfernt`);
+  await loadRated();
+});
+
+document.getElementById('rated-filter').addEventListener('click', e => {
+  const btn = e.target.closest('.filter-btn');
+  if (!btn) return;
+  document.querySelectorAll('#rated-filter .filter-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  state.ratedFilter = btn.dataset.filter;
+  renderRated();
+});
+
+// ══════════════════════════════════════════════════════════
+//  GROUPS
+// ══════════════════════════════════════════════════════════
+async function loadGroups() {
+  const d = await api('/api/groups/mine');
+  state.groups = d.groups || [];
+  state.groupRequests = d.requested || [];
+  renderGroups();
+}
+
+function renderGroups() {
+  const grid = $id('groups-list');
+  grid.innerHTML = '';
+  // Join requests I sent that are still waiting for a member to accept
+  (state.groupRequests || []).forEach(r => {
+    const card = document.createElement('div');
+    card.className = 'group-card group-card-pending';
+    card.innerHTML = `
+      <div class="group-card-name">${esc(r.name)}</div>
+      <div class="group-card-meta">
+        <span class="group-pending-tag">${icon('send', 'sm')}Beitrittsanfrage gesendet</span>
+        <button type="button" class="btn-link" data-withdraw>Zurückziehen</button>
+      </div>`;
+    card.querySelector('[data-withdraw]').addEventListener('click', async e => {
+      e.stopPropagation();
+      await api(`/api/groups/${r.id}/request`, { method: 'DELETE' });
+      toast('Anfrage zurückgezogen');
+      loadGroups();
+    });
+    grid.appendChild(card);
+  });
+  if (!state.groups.length) {
+    if ((state.groupRequests || []).length) return;
+    grid.innerHTML = `<div class="empty-state"><div class="empty-icon i">${icon('users')}</div><p>Noch keine Gruppen.</p><p class="empty-sub">Erstelle eine oder tritt bei.</p></div>`;
+    return;
+  }
+  state.groups.forEach(g => {
+    const card = document.createElement('div');
+    card.className = 'group-card';
+    card.innerHTML = `
+      <div class="group-card-name">${esc(g.name)}</div>
+      <div class="group-card-meta">
+        <span>${g.member_count} ${g.member_count===1?'Mitglied':'Mitglieder'}</span>
+        <span class="group-code" data-code="${esc(g.invite_code)}">${esc(g.invite_code)}</span>
+        ${g.pending_requests ? `<span class="group-req-badge">${g.pending_requests} ${g.pending_requests === 1 ? 'Anfrage' : 'Anfragen'}</span>` : ''}
+      </div>`;
+    card.querySelector('.group-code').addEventListener('click', e => {
+      e.stopPropagation();
+      navigator.clipboard?.writeText(g.invite_code).then(() => toast('📋 Code kopiert!'));
+    });
+    card.addEventListener('click', () => openGroupDetail(g));
+    grid.appendChild(card);
+  });
+}
+
+async function openGroupDetail(group, opts = {}) {
+  $id('groups-main').style.display   = 'none';
+  $id('group-detail').style.display  = '';
+
+  // Load swipe status in parallel
+  const [{ members = [] }, { results = [], memberCount = 0 }, { status: swipeStatus = [] }, { requests: joinRequests = [] }] = await Promise.all([
+    api(`/api/groups/${group.id}/members`),
+    api(`/api/groups/${group.id}/results`),
+    api(`/api/groups/${group.id}/swipe-status`),
+    api(`/api/groups/${group.id}/requests`),
+  ]);
+  const requestsHtml = joinRequests.length ? `
+    <p class="section-label">Beitrittsanfragen</p>
+    <div class="join-requests">${joinRequests.map(r => `
+      <div class="join-request" data-request="${r.id}">
+        <div class="member-card-avatar">${esc((r.username || '?').charAt(0).toUpperCase())}</div>
+        <div class="join-request-info"><b>${esc(r.username)}</b><span>möchte der Gruppe beitreten</span></div>
+        <button type="button" class="btn-ghost" data-request-action="decline" data-user="${r.id}">Ablehnen</button>
+        <button type="button" class="btn-primary" data-request-action="accept" data-user="${r.id}">Annehmen</button>
+      </div>`).join('')}
+    </div>` : '';
+
+  // Build members section with nudge buttons
+  const myId = state.user?.userId;
+  const membersHtml = members.map(m => {
+    const sw = swipeStatus.find(s => s.id === m.id);
+    const isMe = m.id === myId;
+    const pendingCount = sw?.pending ?? '?';
+    const doneCount    = sw?.swiped  ?? 0;
+    const allDone      = sw && sw.pending === 0;
+    const statusColor  = allDone ? 'var(--like)' : pendingCount > 10 ? 'var(--dislike)' : 'var(--accent)';
+
+    return `
+      <div class="member-card">
+        <div class="member-card-avatar">${esc(m.username.charAt(0).toUpperCase())}</div>
+        <div class="member-card-info">
+          <span class="member-card-name">${esc(m.username)}${isMe ? ' <span class="you-badge">(du)</span>' : ''}</span>
+          <span class="member-card-status" style="color:${statusColor}">
+            ${allDone ? withIcon('check', 'Alle geswiped') : `${pendingCount} noch offen`}
+          </span>
+        </div>
+        ${!isMe ? `<button class="nudge-btn" data-nudge="${m.id}" data-name="${esc(m.username)}" title="${esc(m.username)} erinnern zu swipen" aria-label="${esc(m.username)} erinnern zu swipen">${icon('send', 'sm')}</button>` : ''}
+      </div>`;
+  }).join('');
+
+  const tiers = ['einstimmig','mehrheitlich','gespalten','abgelehnt'];
+  const tierLabels = {
+    einstimmig:   withIcon('heart', 'Volle Zustimmung'),
+    mehrheitlich: withIcon('check', 'Mehrheitlich positiv'),
+    gespalten:    withIcon('split', 'Gespalten'),
+    abgelehnt:    withIcon('x', 'Abgelehnt'),
+  };
+
+  const tierSections = tiers.map(tier => {
+    const items = results.filter(r => r.tier === tier);
+    if (!items.length) return '';
+    return `<div class="tier-section">
+      <div class="tier-header tier-${tier}">${tierLabels[tier]} <span style="opacity:.6;font-size:.75rem">(${items.length})</span></div>
+      <div class="rc-grid group-cards" data-tier-grid="${tier}"></div>
+    </div>`;
+  }).join('');
+
+  $id('group-detail-content').innerHTML = `
+    <div class="group-detail-header">
+      <div class="group-detail-name">${esc(group.name)}</div>
+      <div class="invite-row">
+        <span style="font-size:.8rem;color:var(--text2)">Einladungscode:</span>
+        <span class="invite-code-big">${esc(group.invite_code)}</span>
+        <button class="btn-ghost" style="padding:5px 10px;font-size:.76rem" onclick="navigator.clipboard?.writeText('${esc(group.invite_code)}').then(()=>window.__toast('📋 Kopiert!'))" aria-label="Code kopieren">${icon('copy', 'sm')}</button>
+      </div>
+    </div>
+
+    <div class="gd-tabs" id="gd-tabs" role="tablist">
+      <button class="gd-tab active" role="tab" data-gd-tab="ratings" aria-selected="true">Bewertungen</button>
+      <button class="gd-tab" role="tab" data-gd-tab="profile" aria-selected="false">Gruppen-Profil</button>
+    </div>
+
+    <div id="gd-panel-ratings">
+    ${requestsHtml}
+    <p class="section-label">Mitglieder</p>
+    <div class="members-nudge-list" style="margin-bottom:18px">${membersHtml}</div>
+    ${results.length
+      ? `<p class="section-label">${memberCount} ${memberCount === 1 ? "Mitglied" : "Mitglieder"} · ${results.length} gemeinsam bewertet</p>${tierSections}`
+      : '<p style="color:var(--text2);font-size:.85rem">Noch keine Bewertungen in dieser Gruppe.</p>'}
+    </div>
+    <div id="gd-panel-profile" style="display:none"></div>
+  `;
+
+  // Result cards: the same card as "Bewertet", plus every member's vote
+  const reloadGroup = () => setTimeout(() => openGroupDetail(group), 500);
+  results.forEach(r => {
+    const grid = $id('group-detail-content').querySelector(`[data-tier-grid="${r.tier}"]`);
+    if (!grid) return;
+    const listing = { ...r, contacted: r.group_contacted, contact_note: r.group_contact_note || '' };
+    grid.appendChild(buildListCard(listing, { groupId: group.id, votes: r.votes, onChange: reloadGroup }));
+  });
+
+  // Tabs: "Bewertungen" | "Gruppen-Profil" (the latter is rendered by profile.js on first open)
+  const showGroupTab = tab => {
+    $id('gd-tabs').querySelectorAll('.gd-tab').forEach(b => {
+      const on = b.dataset.gdTab === tab;
+      b.classList.toggle('active', on); b.setAttribute('aria-selected', on);
+    });
+    $id('gd-panel-ratings').style.display = tab === 'ratings' ? '' : 'none';
+    $id('gd-panel-profile').style.display = tab === 'profile' ? '' : 'none';
+    if (tab === 'profile') window.renderGroupProfile?.(group, $id('gd-panel-profile'));
+  };
+  $id('gd-tabs').querySelectorAll('.gd-tab').forEach(b => b.addEventListener('click', () => showGroupTab(b.dataset.gdTab)));
+  if (opts.tab === 'profile') showGroupTab('profile');
+  window.__toast = toast;
+
+  // Accept / decline join requests
+  $id('group-detail-content').querySelectorAll('[data-request-action]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const action = btn.dataset.requestAction;
+      btn.closest('.join-request').querySelectorAll('button').forEach(b => { b.disabled = true; });
+      const r = await api(`/api/groups/${group.id}/requests/${btn.dataset.user}/${action}`, { method: 'POST' });
+      if (!r.success) { toast('❌ ' + (r.error || 'Fehler')); openGroupDetail(group); return; }
+      toast(action === 'accept' ? '✓ Beitritt bestätigt' : 'Anfrage abgelehnt');
+      openGroupDetail(group);
+      loadGroups();
+    });
+  });
+
+  // Wire nudge buttons
+  $id('group-detail-content').querySelectorAll('[data-nudge]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const uid  = parseInt(btn.dataset.nudge);
+      const name = btn.dataset.name;
+      btn.disabled = true;
+      btn.innerHTML = icon('refresh', 'sm');
+      const r = await api(`/api/groups/${group.id}/nudge/${uid}`, { method: 'POST' });
+      if (r.success) {
+        toast(`👋 ${name} erinnert!`);
+        btn.innerHTML = icon('check', 'sm');
+        setTimeout(() => { btn.disabled = false; btn.innerHTML = icon('send', 'sm'); }, 30000);
+      } else {
+        toast('❌ ' + (r.error || 'Fehler'));
+        btn.disabled = false; btn.innerHTML = icon('send', 'sm');
+      }
+    });
+  });
+}
+
+$id('back-to-groups').addEventListener('click', () => {
+  $id('group-detail').style.display = 'none';
+  $id('groups-main').style.display  = '';
+  $id('group-detail-content').innerHTML = '';
+});
+
+// Group modals
+$id('create-group-btn').addEventListener('click', () => {
+  $id('new-group-name').value = ''; clr('create-group-error');
+  $id('create-group-modal').style.display = 'flex';
+});
+$id('cancel-create').onclick = () => { $id('create-group-modal').style.display='none'; };
+$id('confirm-create').addEventListener('click', async () => {
+  const name = $id('new-group-name').value.trim();
+  if (!name) return setErr('create-group-error', 'Name erforderlich');
+  const d = await api('/api/groups/create', { method:'POST', body:{ name } });
+  if (d.error) return setErr('create-group-error', d.error);
+  $id('create-group-modal').style.display = 'none';
+  toast(`🎉 Gruppe erstellt! Code: ${d.group.invite_code}`);
+  await loadGroups();
+});
+
+$id('join-group-btn').addEventListener('click', () => {
+  $id('join-code').value = ''; clr('join-group-error');
+  $id('join-group-modal').style.display = 'flex';
+});
+$id('cancel-join').onclick = () => { $id('join-group-modal').style.display='none'; };
+$id('confirm-join').addEventListener('click', async () => {
+  const code = $id('join-code').value.trim();
+  if (!code) return setErr('join-group-error', 'Code eingeben');
+  const d = await api('/api/groups/join', { method:'POST', body:{ code } });
+  if (d.error) return setErr('join-group-error', d.error);
+  $id('join-group-modal').style.display = 'none';
+  if (d.alreadyMember) toast(`✓ Du bist bereits in „${d.group.name}“`);
+  else toast(`✓ Beitrittsanfrage an „${d.group.name}“ gesendet`, 3500);
+  await loadGroups();
+});
+
+document.querySelectorAll('.modal').forEach(m =>
+  m.addEventListener('click', e => { if (e.target===m) m.style.display='none'; })
+);
+
+// ══════════════════════════════════════════════════════════
+//  JOBS (Suchagenten)
+// ══════════════════════════════════════════════════════════
+async function loadJobs() {
+  const d = await api('/api/jobs');
+  populateJobGroupSelect();
+  renderJobs(d.jobs || []);
+}
+
+function renderJobs(jobs) {
+  const list   = $id('jobs-list');
+  const empty  = $id('jobs-empty');
+  const header = $id('jobs-list-header');
+  list.innerHTML = '';
+  if (!jobs.length) { empty.style.display=''; header.style.display='none'; return; }
+  empty.style.display = 'none';
+  header.style.display = 'flex';
+  jobs.forEach(job => list.appendChild(buildJobCard(job)));
+}
+
+$id('reset-all-jobs-btn').addEventListener('click', async () => {
+  const confirmed = confirm(
+    'Alle Suchagenten zurücksetzen?\n\nAlle bisher gefundenen Inserate (inkl. Bewertungen/Notizen dazu) werden gelöscht, danach werden alle Suchagenten neu gescannt. Sinnvoll nach einem Fix am Scraper.'
+  );
+  if (!confirmed) return;
+  const btn = $id('reset-all-jobs-btn');
+  btn.disabled = true; btn.innerHTML = withIcon('refresh', 'Setze zurück…');
+  const r = await api('/api/jobs/reset-all', { method: 'POST' });
+  btn.disabled = false; btn.innerHTML = withIcon('refresh', 'Alle zurücksetzen');
+  if (r.success) {
+    toast(r.message || `✓ ${r.jobCount} Suchagenten zurückgesetzt`);
+    setTimeout(() => loadJobs(), 3000);
+  } else {
+    toast('❌ ' + (r.error || 'Fehler'));
+  }
+});
+
+function buildJobCard(job) {
+  const div = document.createElement('div');
+  div.className = 'job-card' + (job.active ? '' : ' paused');
+  const status = job.last_error ? 'error' : job.active ? 'active' : 'paused';
+  const statusLabel = { error:'Fehler', active:'Aktiv', paused:'Pausiert' }[status];
+  const visLabel = { global: withIcon('globe','Alle'), private: withIcon('lock','Nur ich'), group: withIcon('users','Gruppe') }[job.visibility||'global'];
+  const lastRun = job.last_run
+    ? new Date(job.last_run+'Z').toLocaleString('de-DE',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'})
+    : 'noch nie';
+  const nextDue = job.last_run && job.active ? (() => {
+    const d = Math.round((new Date(job.last_run+'Z').getTime() + job.interval_min*60000 - Date.now()) / 60000);
+    return d > 0 ? `in ${d} Min.` : 'jetzt fällig';
+  })() : job.active ? 'bald' : '—';
+
+  div.innerHTML = `
+    <div class="job-card-top">
+      <div class="job-card-info">
+        <div class="job-card-label">${esc(job.label)}</div>
+        <div class="job-card-url">${esc(job.search_url)}</div>
+        <div class="job-badges">
+          <span class="job-badge platform-${esc(job.platform)}">${esc(job.platform)}</span>
+          <span class="job-badge status-${status}">${statusLabel}</span>
+          <span class="job-badge job-badge-vis">${visLabel}</span>
+        </div>
+      </div>
+    </div>
+    ${job.last_error ? `<div class="job-error">${icon('alert', 'sm')}<span>${esc(job.last_error)}</span></div>` : ''}
+    <div class="job-stats">
+      <span><strong>${job.last_new??0}</strong> neue beim letzten Lauf</span>
+      <span><strong>${job.total_found??0}</strong> gesamt gefunden</span>
+      <span>Zuletzt: <strong>${lastRun}</strong></span>
+      <span>Nächster: <strong>${nextDue}</strong></span>
+    </div>
+    <div class="job-interval-row">
+      Intervall:
+      <input class="interval-input" type="number" value="${job.interval_min}" min="10" max="1440" />
+      Min
+      <button class="btn-ghost" style="padding:3px 8px;font-size:.72rem" data-save-iv>Speichern</button>
+    </div>
+    <div class="job-actions">
+      <button class="btn-run"           data-run>${withIcon('refresh', 'Jetzt abrufen')}</button>
+      <button class="btn-toggle ${job.active?'on':''}" data-toggle>${job.active ? withIcon('pause', 'Pausieren') : withIcon('play', 'Aktivieren')}</button>
+      <button class="btn-vis"           data-vis>${withIcon('lock', 'Sichtbarkeit')}</button>
+      <button class="btn-listings"      data-listings-toggle>${withIcon('list', 'Inserate anzeigen')}</button>
+      <button class="btn-reset"         data-reset>${withIcon('refresh', 'Zurücksetzen')}</button>
+      <button class="btn-del"           data-del>${withIcon('trash', 'Löschen')}</button>
+    </div>
+    <div class="job-listings-panel" style="display:none" data-listings-panel>
+      <div class="job-listings-grid listings-grid rc-grid" data-listings-grid></div>
+    </div>
+    <div class="vis-panel" style="display:none" data-vis-panel>
+      <div class="vis-panel-inner">
+        <span style="font-size:.78rem;color:var(--text2)">Wer sieht diese Inserate?</span>
+        <div class="vis-options">
+          <label class="vis-option ${(job.visibility||'global')==='global'?'active':''}">
+            <input type="radio" name="vis_${job.id}" value="global" ${(job.visibility||'global')==='global'?'checked':''} /> ${withIcon('globe', 'Alle Nutzer')}
+          </label>
+          <label class="vis-option ${job.visibility==='private'?'active':''}">
+            <input type="radio" name="vis_${job.id}" value="private" ${job.visibility==='private'?'checked':''} /> ${withIcon('lock', 'Nur ich')}
+          </label>
+          <label class="vis-option ${job.visibility==='group'?'active':''}">
+            <input type="radio" name="vis_${job.id}" value="group" ${job.visibility==='group'?'checked':''} /> ${withIcon('users', 'Gruppe')}
+          </label>
+        </div>
+        <select class="vis-group-sel" style="${job.visibility==='group'?'':'display:none'}">
+          <option value="">Gruppe wählen…</option>
+          ${state.groups.map(g=>`<option value="${g.id}" ${job.visibility_id==g.id?'selected':''}>${esc(g.name)}</option>`).join('')}
+        </select>
+        <button class="btn-vis-save" data-vis-save>Speichern</button>
+      </div>
+    </div>`;
+
+  div.querySelector('[data-listings-toggle]').addEventListener('click', async () => {
+    const panel = div.querySelector('[data-listings-panel]');
+    const grid  = div.querySelector('[data-listings-grid]');
+    const btn   = div.querySelector('[data-listings-toggle]');
+    const isOpen = panel.style.display !== 'none';
+    if (isOpen) { panel.style.display = 'none'; return; }
+
+    panel.style.display = '';
+    btn.innerHTML = withIcon('refresh', 'Lädt…');
+    const d = await api(`/api/jobs/${job.id}/listings`);
+    btn.innerHTML = withIcon('list', 'Inserate anzeigen');
+    grid.innerHTML = '';
+    const listings = d.listings || [];
+    if (!listings.length) {
+      grid.innerHTML = '<p style="font-size:.82rem;color:var(--text2);grid-column:1/-1">Noch keine Inserate von diesem Suchagenten gefunden.</p>';
+      return;
+    }
+    listings.forEach(l => grid.appendChild(buildListCard(l)));
+  });
+
+  div.querySelector('[data-run]').addEventListener('click', async () => {
+    const btn = div.querySelector('[data-run]');
+    btn.disabled = true; btn.innerHTML = withIcon('refresh', 'Lädt…');
+    const r = await api(`/api/jobs/${job.id}/run`, { method:'POST' });
+    toast(r.message || 'Job gestartet');
+    btn.disabled = false; btn.innerHTML = withIcon('refresh', 'Jetzt abrufen');
+    setTimeout(() => loadJobs(), 3000);
+  });
+  div.querySelector('[data-reset]').addEventListener('click', async () => {
+    const confirmed = confirm(
+      `„${job.label}" zurücksetzen?\n\nAlle bisher von diesem Suchagenten gefundenen Inserate werden gelöscht (inkl. Bewertungen/Notizen dazu), danach wird sofort neu gescannt. Das ist sinnvoll nach einem Fix am Scraper, um veraltete/fehlerhafte Daten loszuwerden.`
+    );
+    if (!confirmed) return;
+    const btn = div.querySelector('[data-reset]');
+    btn.disabled = true; btn.innerHTML = withIcon('refresh', 'Setze zurück…');
+    const r = await api(`/api/jobs/${job.id}/reset`, { method:'POST' });
+    if (r.success) {
+      toast(r.message || `✓ ${r.removed} Inserate entfernt, wird neu gescannt…`);
+      setTimeout(() => loadJobs(), 3000);
+    } else {
+      toast('❌ ' + (r.error || 'Fehler'));
+      btn.disabled = false; btn.innerHTML = withIcon('refresh', 'Zurücksetzen');
+    }
+  });
+  div.querySelector('[data-toggle]').addEventListener('click', async () => {
+    await api(`/api/jobs/${job.id}/toggle`, { method:'PATCH' });
+    toast(job.active ? '⏸ Pausiert' : '▶ Aktiviert');
+    loadJobs();
+  });
+  // Visibility toggle
+  div.querySelector('[data-vis]').addEventListener('click', () => {
+    const panel = div.querySelector('[data-vis-panel]');
+    panel.style.display = panel.style.display === 'none' ? '' : 'none';
+  });
+
+  // Show/hide group select when radio changes
+  div.querySelectorAll(`input[name="vis_${job.id}"]`).forEach(radio => {
+    radio.addEventListener('change', () => {
+      const grpSel = div.querySelector('.vis-group-sel');
+      grpSel.style.display = radio.value === 'group' ? '' : 'none';
+      // Update active class
+      div.querySelectorAll('.vis-option').forEach(o => o.classList.remove('active'));
+      radio.closest('.vis-option').classList.add('active');
+    });
+  });
+
+  // Save visibility
+  div.querySelector('[data-vis-save]').addEventListener('click', async () => {
+    const radio  = div.querySelector(`input[name="vis_${job.id}"]:checked`);
+    const vis    = radio?.value || 'global';
+    const grpSel = div.querySelector('.vis-group-sel');
+    const grpId  = vis === 'group' ? grpSel.value : null;
+    if (vis === 'group' && !grpId) { toast('⚠️ Bitte eine Gruppe wählen'); return; }
+    const r = await api(`/api/jobs/${job.id}/visibility`, { method:'PATCH', body:{ visibility:vis, visibility_id:grpId } });
+    if (r.success) { toast('✅ Sichtbarkeit gespeichert'); setTimeout(loadJobs, 300); }
+    else toast('❌ ' + (r.error||'Fehler'));
+  });
+
+  div.querySelector('[data-del]').addEventListener('click', async () => {
+    if (!confirm(`Suchagent "${job.label}" löschen?`)) return;
+    await api(`/api/jobs/${job.id}`, { method:'DELETE' });
+    div.style.opacity='0'; div.style.transition='opacity .3s';
+    setTimeout(() => { div.remove(); loadJobs(); }, 280);
+    toast('🗑 Suchagent gelöscht');
+  });
+  div.querySelector('[data-save-iv]').addEventListener('click', async () => {
+    const iv = parseInt(div.querySelector('.interval-input').value)||60;
+    const r = await api(`/api/jobs/${job.id}/interval`, { method:'PATCH', body:{ interval_min:iv } });
+    if (r.success) toast(`✅ Intervall: ${r.interval_min} Min.`);
+    loadJobs();
+  });
+  return div;
+}
+
+$id('job-add-btn').addEventListener('click', async () => {
+  const label      = $id('job-label').value.trim();
+  const url        = $id('job-url').value.trim();
+  const iv         = parseInt($id('job-interval').value)||60;
+  const visibility = $id('job-visibility').value;
+  const visGrp     = $id('job-visibility-group').value;
+  clr('job-error');
+  if (!label) return setErr('job-error', 'Bezeichnung erforderlich');
+  if (!url.startsWith('http')) return setErr('job-error', 'Gültige Such-URL erforderlich');
+  if (visibility === 'group' && !visGrp) return setErr('job-error', 'Bitte eine Gruppe wählen');
+  const btnText=$id('job-add-text'), spinner=$id('job-add-spinner'), btn=$id('job-add-btn');
+  btnText.style.display='none'; spinner.style.display='inline'; btn.disabled=true;
+  const d = await api('/api/jobs', { method:'POST', body:{
+    label, search_url:url, interval_min:iv,
+    visibility, visibility_id: visibility==='group' ? visGrp : null
+  }});
+  btnText.style.display='inline'; spinner.style.display='none'; btn.disabled=false;
+  if (d.error) return setErr('job-error', d.error);
+  $id('job-label').value = ''; $id('job-url').value = '';
+  toast('✅ Suchagent hinzugefügt – erster Lauf startet in Kürze');
+  api(`/api/jobs/${d.job.id}/run`, { method:'POST' }).then(() => setTimeout(loadJobs, 4000));
+  loadJobs();
+});
+
+// Show/hide group selector based on visibility choice
+$id('job-visibility').addEventListener('change', () => {
+  const isGroup = $id('job-visibility').value === 'group';
+  $id('job-visibility-group-row').style.display = isGroup ? '' : 'none';
+});
+
+function populateJobGroupSelect() {
+  const sel = $id('job-visibility-group');
+  while (sel.options.length > 1) sel.remove(1);
+  state.groups.forEach(g => {
+    const o = document.createElement('option');
+    o.value = g.id; o.textContent = g.name;
+    sel.appendChild(o);
+  });
+}
+
+// ══════════════════════════════════════════════════════════
+//  SETTINGS
+// ══════════════════════════════════════════════════════════
+async function loadSettings() {
+  const me = await api('/api/auth/me');
+  if (!me.loggedIn) return;
+  const ch = s => s.charAt(0).toUpperCase();
+  $id('settings-avatar').textContent       = ch(me.username||'?');
+  $id('settings-display-name').textContent  = me.username||'—';
+  $id('settings-display-email').textContent = me.email||'—';
+  if (me.created_at)
+    $id('settings-display-since').textContent = 'Mitglied seit ' +
+      new Date(me.created_at).toLocaleDateString('de-DE',{year:'numeric',month:'long',day:'numeric'});
+  $id('settings-username').value  = me.username||'';
+  $id('settings-email').value     = me.email||'';
+  clr('settings-username-error','settings-username-ok','settings-email-error','settings-email-ok','settings-pw-error','settings-pw-ok','notify-ok','ntfy-ok');
+  $id('settings-pw-current').value = $id('settings-pw-new').value = $id('settings-pw-confirm').value = '';
+  $id('settings-email-pw').value = '';
+
+  // Notification toggles
+  $id('notify-email').checked = !!me.notify_email;
+
+  // Per-type/per-channel matrix
+  const matrix = me.notify_matrix || {};
+  document.querySelectorAll('.notify-matrix-row').forEach(row => {
+    const type = row.dataset.type;
+    row.querySelectorAll('input[data-channel]').forEach(cb => {
+      const channel = cb.dataset.channel;
+      cb.checked = !!matrix[type]?.[channel];
+    });
+  });
+
+  // ntfy fields
+  $id('ntfy-topic').value  = me.ntfy_topic  || '';
+  $id('ntfy-server').value = me.ntfy_server || '';
+
+  // Threshold
+  $id('notify-threshold').value = me.notify_threshold || 1;
+
+  // Digest interval buttons
+  const interval = me.notify_digest_interval || 'instant';
+  document.querySelectorAll('.digest-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.interval === interval);
+  });
+
+  // Stats
+  const s = await api('/api/auth/stats');
+  $id('stat-likes').textContent      = s.likes      ?? '—';
+  $id('stat-superlikes').textContent = s.superlikes ?? '—';
+  $id('stat-dislikes').textContent   = s.dislikes   ?? '—';
+  $id('stat-groups').textContent     = s.groups     ?? '—';
+
+  // Push button state
+  await updatePushButtonState();
+
+  // Admin section
+  const adminSection = $id('admin-section');
+  if (adminSection) adminSection.style.display = me.is_admin ? '' : 'none';
+}
+
+$id('save-username-btn').addEventListener('click', async () => {
+  clr('settings-username-error','settings-username-ok');
+  const d = await api('/api/user/username', { method:'PUT', body:{ username:$id('settings-username').value.trim() } });
+  if (d.error) return setErr('settings-username-error', d.error);
+  setNavUser(d.username);
+  $id('settings-display-name').textContent = d.username;
+  $id('settings-avatar').textContent = d.username.charAt(0).toUpperCase();
+  setOk('settings-username-ok','✓ Gespeichert'); toast('✅ Username geändert');
+});
+
+$id('save-email-btn').addEventListener('click', async () => {
+  clr('settings-email-error','settings-email-ok');
+  const pw = $id('settings-email-pw').value;
+  if (!pw) return setErr('settings-email-error','Bitte aktuelles Passwort eingeben');
+  const d = await api('/api/user/email', { method:'PUT', body:{ email:$id('settings-email').value.trim(), currentPassword:pw } });
+  if (d.error) return setErr('settings-email-error', d.error);
+  $id('settings-email-pw').value = '';
+  $id('settings-display-email').textContent = $id('settings-email').value.trim();
+  setOk('settings-email-ok','✓ Gespeichert'); toast('✅ E-Mail geändert');
+});
+
+$id('save-password-btn').addEventListener('click', async () => {
+  clr('settings-pw-error','settings-pw-ok');
+  const cur = $id('settings-pw-current').value;
+  const nw  = $id('settings-pw-new').value;
+  const cf  = $id('settings-pw-confirm').value;
+  if (!cur)         return setErr('settings-pw-error','Aktuelles Passwort eingeben');
+  if (nw.length<6)  return setErr('settings-pw-error','Neues Passwort mind. 6 Zeichen');
+  if (nw !== cf)    return setErr('settings-pw-error','Passwörter stimmen nicht überein');
+  const d = await api('/api/user/password', { method:'PUT', body:{ currentPassword:cur, newPassword:nw } });
+  if (d.error) return setErr('settings-pw-error', d.error);
+  $id('settings-pw-current').value = $id('settings-pw-new').value = $id('settings-pw-confirm').value = '';
+  setOk('settings-pw-ok','✓ Passwort geändert'); toast('✅ Passwort geändert');
+});
+
+// Reads the current state of all matrix checkboxes into a plain object
+// like { match: {email,push,ntfy}, new: {...}, nudge: {...}, change: {...} }
+function readMatrixFromUI() {
+  const matrix = {};
+  document.querySelectorAll('.notify-matrix-row').forEach(row => {
+    const type = row.dataset.type;
+    matrix[type] = {};
+    row.querySelectorAll('input[data-channel]').forEach(cb => {
+      matrix[type][cb.dataset.channel] = cb.checked;
+    });
+  });
+  return matrix;
+}
+
+// Notification toggles save on change
+$id('notify-email').addEventListener('change', saveNotifySettings);
+document.querySelectorAll('.notify-matrix-row input[data-channel]').forEach(cb => {
+  cb.addEventListener('change', saveNotifySettings);
+});
+
+// Digest interval buttons
+document.querySelectorAll('.digest-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.digest-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    saveNotifySettings();
+  });
+});
+
+// ntfy save button
+$id('save-ntfy-btn').addEventListener('click', async () => {
+  clr('ntfy-ok');
+  const d = await api('/api/user/notifications', { method:'PUT', body:{
+    notify_email: $id('notify-email').checked ? 1 : 0,
+    notify_push:  1,
+    notify_digest_interval: document.querySelector('.digest-btn.active')?.dataset.interval || 'instant',
+    ntfy_topic:       $id('ntfy-topic').value.trim(),
+    ntfy_server:      $id('ntfy-server').value.trim(),
+    notify_threshold: parseInt($id('notify-threshold')?.value) || 1,
+    notify_matrix:    readMatrixFromUI(),
+  }});
+  if (d.success) { setOk('ntfy-ok','✓ Gespeichert'); toast('✅ ntfy gespeichert'); }
+  else toast('❌ ' + (d.error || 'Fehler'));
+});
+
+async function saveNotifySettings() {
+  const d = await api('/api/user/notifications', { method:'PUT', body:{
+    notify_email:           $id('notify-email').checked ? 1 : 0,
+    notify_push:            1,
+    notify_digest_interval: document.querySelector('.digest-btn.active')?.dataset.interval || 'instant',
+    ntfy_topic:             $id('ntfy-topic').value.trim(),
+    ntfy_server:            $id('ntfy-server').value.trim(),
+    notify_threshold:       parseInt($id('notify-threshold')?.value) || 1,
+    notify_matrix:          readMatrixFromUI(),
+  }});
+  if (d.success) setOk('notify-matrix-ok','✓ Gespeichert');
+  else toast('❌ ' + (d.error || 'Fehler'));
+}
+
+// ── Web Push ──────────────────────────────────────────────
+async function updatePushButtonState() {
+  const btn = $id('push-toggle-btn');
+  const txt = $id('push-status-text');
+  if (!('Notification' in window) || !('serviceWorker' in navigator)) {
+    txt.textContent = 'Nicht unterstützt von diesem Browser'; btn.style.display='none'; return;
+  }
+  const reg = await navigator.serviceWorker.getRegistration().catch(()=>null);
+  const sub = reg ? await reg.pushManager.getSubscription().catch(()=>null) : null;
+  if (sub) {
+    txt.textContent = 'Aktiviert'; btn.textContent = 'Deaktivieren';
+  } else {
+    txt.textContent = 'Nicht aktiviert'; btn.textContent = 'Aktivieren';
+  }
+}
+
+$id('push-toggle-btn').addEventListener('click', async () => {
+  const { publicKey } = await api('/api/push/vapid-key');
+  if (!publicKey) {
+    toast('⚠️ Push-Benachrichtigungen nicht konfiguriert'); return;
+  }
+  const reg = await navigator.serviceWorker.ready;
+  const existing = await reg.pushManager.getSubscription().catch(()=>null);
+  if (existing) {
+    await existing.unsubscribe();
+    await api('/api/push/unsubscribe', { method:'POST', body:{ endpoint: existing.endpoint } });
+    toast('🔕 Browser-Benachrichtigungen deaktiviert');
+  } else {
+    const perm = await Notification.requestPermission();
+    if (perm !== 'granted') { toast('❌ Benachrichtigungen nicht erlaubt'); return; }
+    const sub = await reg.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: urlBase64ToUint8Array(publicKey),
+    });
+    await api('/api/push/subscribe', { method:'POST', body:{
+      endpoint: sub.endpoint,
+      keys: { p256dh: arrayBufferToBase64(sub.getKey('p256dh')), auth: arrayBufferToBase64(sub.getKey('auth')) }
+    }});
+    toast('🔔 Browser-Benachrichtigungen aktiviert');
+  }
+  await updatePushButtonState();
+});
+
+function urlBase64ToUint8Array(b64) {
+  const p = (b64+'='.repeat((4-b64.length%4)%4)).replace(/-/g,'+').replace(/_/g,'/');
+  const r = atob(p); const o = new Uint8Array(r.length);
+  for (let i=0;i<r.length;++i) o[i]=r.charCodeAt(i);
+  return o;
+}
+function arrayBufferToBase64(buf) {
+  return btoa(String.fromCharCode(...new Uint8Array(buf)));
+}
+
+// ── Service Worker (für Push) ─────────────────────────────
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('/sw.js').catch(()=>{});
+}
+
+
+
+// (markGroupContacted prompt()-based helper removed — contact marking now
+//  lives inside the unified card-menu, wired directly in openGroupDetail())
+
+// ══════════════════════════════════════════════════════════
+//  ARCHIVE
+// ══════════════════════════════════════════════════════════
+let _archiveAll = [];
+let _archiveFilter = 'all';
+
+async function loadArchive() {
+  const d = await api('/api/archive');
+  _archiveAll = d.listings || [];
+  renderArchive();
+}
+
+function renderArchive() {
+  const list  = $id('archive-list');
+  const empty = $id('archive-empty');
+  let items = _archiveAll;
+  if (_archiveFilter === 'contacted') {
+    items = items.filter(l => l.contacted);
+  } else if (_archiveFilter !== 'all') {
+    items = items.filter(l => l.my_swipe === _archiveFilter);
+  }
+  list.innerHTML = '';
+  if (!items.length) { empty.style.display = ''; return; }
+  empty.style.display = 'none';
+  items.forEach(l => {
+    const card = buildListCard({ ...l, contact_note: l.contact_note }, { isArchive: true });
+    card.classList.add('archived');
+    list.appendChild(card);
+  });
+}
+
+$id('archive-filter')?.addEventListener('click', e => {
+  const btn = e.target.closest('.filter-btn');
+  if (!btn) return;
+  $id('archive-filter').querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  _archiveFilter = btn.dataset.filter;
+  renderArchive();
+});
+
+
+// ══════════════════════════════════════════════════════════
+//  ADMIN
+// ══════════════════════════════════════════════════════════
+$id('admin-users-btn')?.addEventListener('click', async () => {
+  const panel = $id('admin-users-panel');
+  if (panel.style.display !== 'none') { panel.style.display = 'none'; return; }
+  panel.style.display = '';
+  const { users = [] } = await api('/api/admin/users');
+  const list = $id('admin-users-list');
+  list.innerHTML = '';
+  users.forEach(u => {
+    const row = document.createElement('div');
+    row.className = 'admin-user-row';
+    row.innerHTML = `
+      <div class="admin-user-info">
+        <span class="admin-user-name">${esc(u.username)}</span>
+        <span class="admin-user-email">${esc(u.email)}</span>
+        ${u.is_admin ? '<span class="admin-badge">Admin</span>' : ''}
+      </div>
+      <div class="admin-user-actions">
+        ${!u.is_admin
+          ? `<button class="btn-ghost" style="font-size:.75rem;padding:4px 10px" data-promote="${u.id}">Admin machen</button>`
+          : `<button class="btn-ghost" style="font-size:.75rem;padding:4px 10px;color:var(--dislike)" data-demote="${u.id}">Admin-Rechte entfernen</button>`}
+      </div>`;
+
+    row.querySelector('[data-promote]')?.addEventListener('click', async () => {
+      const r = await api('/api/admin/promote', { method: 'POST', body: { targetUserId: u.id } });
+      if (r.success) { toast('✓ ' + r.message); $id('admin-users-btn').click(); $id('admin-users-btn').click(); }
+      else toast('❌ ' + (r.error || 'Fehler'));
+    });
+    row.querySelector('[data-demote]')?.addEventListener('click', async () => {
+      const r = await api('/api/admin/demote', { method: 'POST', body: { targetUserId: u.id } });
+      if (r.success) { toast('✓ Admin-Rechte entfernt'); $id('admin-users-btn').click(); $id('admin-users-btn').click(); }
+      else toast('❌ ' + (r.error || 'Fehler'));
+    });
+
+    list.appendChild(row);
+  });
+});
+
+// Opens the detail view for a listing referenced by a shared link
+// (?listing=<id> in the URL), then cleans the URL so a refresh doesn't
+// re-trigger it. Works for any listing the current user can technically
+// see via GET /api/listings/:id (bypasses the normal swipe-queue
+// visibility scoping — see that endpoint's comment for why).
+async function openSharedListingFromUrl() {
+  const params = new URLSearchParams(location.search);
+  const sharedId = params.get('listing');
+  if (!sharedId) return;
+
+  // Strip the param immediately regardless of outcome, so the URL is
+  // clean and a page refresh won't keep re-opening the same listing.
+  params.delete('listing');
+  const cleanUrl = location.pathname + (params.toString() ? `?${params}` : '') + location.hash;
+  history.replaceState(history.state, '', cleanUrl);
+
+  const d = await api(`/api/listings/${sharedId}`);
+  if (d.error || !d.listing) { toast('❌ Geteiltes Inserat nicht gefunden'); return; }
+  detailView.open(d.listing, { fromSwipe: true });
+}
+
+// Applicant profile page, message generator and group profile tab live in profile.js
+
+// ══════════════════════════════════════════════════════════
+//  OVERLAYS → phone back button
+//  Everything that lies on top of a page registers here, so the back
+//  gesture closes it first (see nav.js).
+// ══════════════════════════════════════════════════════════
+nav.register({ el: $id('lightbox'),    isOpen: () => $id('lightbox').style.display === 'flex',    close: () => lb.close() });
+nav.register({ el: $id('detail-view'), isOpen: () => $id('detail-view').style.display === 'flex', close: () => detailView.close() });
+document.querySelectorAll('.modal').forEach(m => nav.register({
+  el: m,
+  isOpen: () => m.style.display === 'flex',
+  close:  () => (m.id === 'message-modal' && typeof messageModal !== 'undefined') ? messageModal.close() : (m.style.display = 'none'),
+}));
+// The detail page of a group is a level inside "Gruppen"
+nav.register({ el: $id('group-detail'), isOpen: () => $id('group-detail').style.display !== 'none', close: () => $id('back-to-groups').click() });
+
+// ══════════════════════════════════════════════════════════
+//  INIT
+// ══════════════════════════════════════════════════════════
+(async () => {
+  const me = await api('/api/auth/me');
+  if (me.loggedIn) {
+    state.user = { userId: me.id, username: me.username };
+    setNavUser(me.username);
+    showScreen('app-screen');
+    await enterApp();
+  } else {
+    showScreen('auth-screen');
+  }
+})();

@@ -1,0 +1,2737 @@
+const express    = require('express');
+// Patches Express's routing so a rejected Promise inside an `async (req,res)
+// => {...}` handler reaches the error middleware below instead of becoming
+// an unhandled rejection that (on modern Node) kills the whole process. Must
+// be required before any routes are defined.
+require('express-async-errors');
+const session    = require('express-session');
+const helmet     = require('helmet');
+const rateLimit  = require('express-rate-limit');
+const bcrypt     = require('bcryptjs');
+const initSqlJs  = require('sql.js');
+const fetch      = require('node-fetch');
+const path       = require('path');
+const fs         = require('fs');
+const crypto     = require('crypto');
+const MemoryStore = require('memorystore')(session);
+const webpush    = require('web-push');
+const { computeClusters } = require('./dedupe');
+const { pollSearchJob, checkExistingListings, detectPlatform, scrapeListing, validateSearchUrl, isUrlAllowed, safeAgentFor, safeHttpsAgent } = require('./poller');
+const mailer     = require('./mailer');
+const P          = require('./profile');
+
+const app  = express();
+const PORT = process.env.PORT || 3000;
+
+// ── Crash safety net ────────────────────────────────────────
+// Background work (the search-job scheduler, digest flush, status checks –
+// see startScheduler() below) runs outside any Express request, so
+// express-async-errors can't help there: a rejected promise or stray throw
+// in a setInterval/setTimeout callback (e.g. a scraper choking on an
+// unexpected page) has nothing to catch it and, since Node 15, that alone
+// takes the whole process down. These are the last line of defence: log and
+// keep running rather than silently killing the app (and every logged-in
+// user's session) for everyone.
+process.on('unhandledRejection', (reason) => {
+  console.error('[unhandledRejection]', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[uncaughtException]', err);
+});
+
+// ── Web Push VAPID setup ──────────────────────────────────
+let VAPID_PUBLIC, VAPID_PRIVATE;
+// Defined below, next to the database (dbDir) — i.e. on the persistent
+// volume in Docker, so the keys (and with them every browser's push
+// subscription) survive a container being recreated.
+let vapidFile;
+
+function initVapid() {
+  try {
+    if (fs.existsSync(vapidFile)) {
+      const keys = JSON.parse(fs.readFileSync(vapidFile, 'utf8'));
+      VAPID_PUBLIC  = keys.publicKey;
+      VAPID_PRIVATE = keys.privateKey;
+    } else {
+      const keys = webpush.generateVAPIDKeys();
+      VAPID_PUBLIC  = keys.publicKey;
+      VAPID_PRIVATE = keys.privateKey;
+      fs.mkdirSync(path.dirname(vapidFile), { recursive: true });
+      fs.writeFileSync(vapidFile, JSON.stringify(keys));
+    }
+    webpush.setVapidDetails(
+      process.env.VAPID_SUBJECT || 'mailto:admin@wohnungsswipe.local',
+      VAPID_PUBLIC,
+      VAPID_PRIVATE
+    );
+    console.log('[Push] VAPID initialisiert');
+  } catch (e) {
+    console.error('[Push] VAPID-Fehler:', e.message);
+  }
+}
+
+// ── Database ──────────────────────────────────────────────
+const dbPath = process.env.DB_PATH || path.join(__dirname, '../data/wohnungsswipe.db');
+const dbDir  = path.dirname(dbPath);
+if (!fs.existsSync(dbDir)) fs.mkdirSync(dbDir, { recursive: true });
+vapidFile = process.env.VAPID_FILE || path.join(dbDir, 'vapid.json');
+
+let db;
+
+async function initDb() {
+  const SQL = await initSqlJs();
+  db = fs.existsSync(dbPath)
+    ? new SQL.Database(fs.readFileSync(dbPath))
+    : new SQL.Database();
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS users (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      username      TEXT UNIQUE NOT NULL,
+      email         TEXT UNIQUE NOT NULL,
+      password_hash TEXT NOT NULL,
+      created_at    DATETIME DEFAULT CURRENT_TIMESTAMP,
+      reset_token   TEXT,
+      reset_expires DATETIME,
+      notify_email           INTEGER DEFAULT 1,
+      notify_push            INTEGER DEFAULT 1,
+      notify_match           INTEGER DEFAULT 1,
+      notify_new             INTEGER DEFAULT 1,
+      notify_digest_interval TEXT    DEFAULT 'instant',
+      ntfy_topic             TEXT    DEFAULT '',
+      ntfy_server            TEXT    DEFAULT '',
+      notify_threshold       INTEGER DEFAULT 1,
+      unsubscribe_token      TEXT    DEFAULT '',
+      is_admin               INTEGER DEFAULT 0,
+      notify_matrix          TEXT
+    );
+    CREATE TABLE IF NOT EXISTS groups_table (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      name        TEXT NOT NULL,
+      invite_code TEXT UNIQUE NOT NULL,
+      created_by  INTEGER,
+      created_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS group_members (
+      group_id  INTEGER,
+      user_id   INTEGER,
+      joined_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (group_id, user_id)
+    );
+    CREATE TABLE IF NOT EXISTS listings (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      url         TEXT UNIQUE NOT NULL,
+      title       TEXT,
+      price       TEXT,
+      price_cold  TEXT,
+      size        TEXT,
+      location    TEXT,
+      rooms       TEXT,
+      image_url   TEXT,
+      images_json TEXT DEFAULT '[]',
+      tags_json   TEXT DEFAULT '[]',
+      description TEXT,
+      platform    TEXT DEFAULT 'unbekannt',
+      status      TEXT DEFAULT 'active',
+      added_by      INTEGER,
+      source_job_id INTEGER,
+      visibility    TEXT DEFAULT 'global',
+      visibility_id INTEGER,
+      nebenkosten     TEXT,
+      heizkosten      TEXT,
+      kaution         TEXT,
+      available_from  TEXT,
+      property_type   TEXT,
+      latitude        REAL,
+      longitude       REAL,
+      added_at      DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS swipes (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id    INTEGER,
+      listing_id INTEGER,
+      action     TEXT CHECK(action IN ('like','dislike','superlike','skip')),
+      swiped_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(user_id, listing_id)
+    );
+    CREATE TABLE IF NOT EXISTS search_jobs (
+      id           INTEGER PRIMARY KEY AUTOINCREMENT,
+      label        TEXT NOT NULL,
+      search_url   TEXT UNIQUE NOT NULL,
+      platform     TEXT DEFAULT 'unbekannt',
+      interval_min INTEGER DEFAULT 60,
+      active       INTEGER DEFAULT 1,
+      last_run     DATETIME,
+      last_error   TEXT,
+      last_new     INTEGER DEFAULT 0,
+      total_found  INTEGER DEFAULT 0,
+      added_by        INTEGER,
+      visibility      TEXT DEFAULT 'global',
+      visibility_id   INTEGER,
+      created_at      DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS push_subscriptions (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id    INTEGER NOT NULL,
+      endpoint   TEXT UNIQUE NOT NULL,
+      p256dh     TEXT NOT NULL,
+      auth       TEXT NOT NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS contacts (
+      id           INTEGER PRIMARY KEY AUTOINCREMENT,
+      listing_id   INTEGER NOT NULL,
+      user_id      INTEGER,
+      group_id     INTEGER,
+      note         TEXT DEFAULT '',
+      contacted_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(listing_id, user_id, group_id)
+    );
+    CREATE TABLE IF NOT EXISTS notification_queue (
+      id           INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id      INTEGER NOT NULL,
+      type         TEXT NOT NULL,
+      title        TEXT NOT NULL,
+      body         TEXT NOT NULL,
+      url          TEXT DEFAULT '/',
+      created_at   DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS archive_notes (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      listing_id  INTEGER UNIQUE NOT NULL,
+      reason      TEXT DEFAULT 'offline',
+      archived_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS listing_changes (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      listing_id INTEGER NOT NULL,
+      field      TEXT NOT NULL,
+      old_value  TEXT,
+      new_value  TEXT,
+      changed_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS applicant_profiles (
+      user_id        INTEGER PRIMARY KEY,
+      display_name   TEXT DEFAULT '',
+      occupation     TEXT DEFAULT '',
+      household_size TEXT DEFAULT '',
+      move_in_date   TEXT DEFAULT '',
+      move_in_type   TEXT DEFAULT 'date',
+      smoker         INTEGER DEFAULT 0,
+      pets           TEXT DEFAULT '',
+      income_note    TEXT DEFAULT '',
+      about_text     TEXT DEFAULT '',
+      formal         INTEGER DEFAULT 1,
+      custom_template TEXT DEFAULT '',
+      updated_at     DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS group_settings (
+      group_id     INTEGER PRIMARY KEY,
+      move_in_type TEXT DEFAULT '',
+      move_in_date TEXT DEFAULT '',
+      updated_by   INTEGER,
+      updated_at   DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS group_profiles (
+      group_id       INTEGER PRIMARY KEY,
+      household_type TEXT DEFAULT '',
+      persons        INTEGER DEFAULT 0,
+      children       INTEGER DEFAULT 0,
+      move_in_type   TEXT DEFAULT '',
+      move_in_date   TEXT DEFAULT '',
+      lease_duration TEXT DEFAULT '',
+      smoker         INTEGER DEFAULT 0,
+      pets           TEXT DEFAULT '',
+      income_range   TEXT DEFAULT '',
+      documents_json TEXT DEFAULT '[]',
+      about_text     TEXT DEFAULT '',
+      phone          TEXT DEFAULT '',
+      availability   TEXT DEFAULT '',
+      share_json     TEXT DEFAULT '{}',
+      updated_by     INTEGER,
+      updated_at     DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS group_templates (
+      user_id    INTEGER NOT NULL,
+      group_id   INTEGER NOT NULL,
+      template   TEXT DEFAULT '',
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (user_id, group_id)
+    );
+    -- Entering an invite code no longer makes you a member straight away: it
+    -- files a request here that an existing member has to accept, since
+    -- membership exposes the group profile (phone, income, documents) and
+    -- the contact notes.
+    CREATE TABLE IF NOT EXISTS group_join_requests (
+      group_id   INTEGER NOT NULL,
+      user_id    INTEGER NOT NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (group_id, user_id)
+    );
+    CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT);
+  `);
+
+  // Migrations
+  const migrate = (sql) => { try { db.run(sql); } catch(_) {} };
+  migrate("ALTER TABLE listings ADD COLUMN price_cold  TEXT");
+  migrate("ALTER TABLE listings ADD COLUMN images_json TEXT DEFAULT '[]'");
+  migrate("ALTER TABLE listings ADD COLUMN tags_json   TEXT DEFAULT '[]'");
+  migrate("ALTER TABLE listings ADD COLUMN status      TEXT DEFAULT 'active'");
+  migrate("ALTER TABLE users    ADD COLUMN reset_token   TEXT");
+  migrate("ALTER TABLE users    ADD COLUMN reset_expires DATETIME");
+  migrate("ALTER TABLE users    ADD COLUMN notify_email  INTEGER DEFAULT 1");
+  migrate("ALTER TABLE users    ADD COLUMN notify_push   INTEGER DEFAULT 1");
+  migrate("ALTER TABLE users    ADD COLUMN notify_match  INTEGER DEFAULT 1");
+  migrate("ALTER TABLE users    ADD COLUMN notify_new             INTEGER DEFAULT 1");
+  migrate("ALTER TABLE users    ADD COLUMN notify_digest_interval TEXT    DEFAULT 'instant'");
+  migrate("ALTER TABLE users    ADD COLUMN ntfy_topic             TEXT    DEFAULT ''");
+  migrate("ALTER TABLE users    ADD COLUMN ntfy_server            TEXT    DEFAULT ''");
+  migrate("ALTER TABLE users    ADD COLUMN notify_threshold       INTEGER DEFAULT 1");
+  migrate("ALTER TABLE users    ADD COLUMN unsubscribe_token      TEXT    DEFAULT ''");
+  migrate("ALTER TABLE users    ADD COLUMN is_admin               INTEGER DEFAULT 0");
+  migrate("ALTER TABLE search_jobs ADD COLUMN visibility    TEXT DEFAULT 'global'");
+  migrate("ALTER TABLE listings    ADD COLUMN source_job_id INTEGER");
+  migrate("ALTER TABLE listings    ADD COLUMN visibility    TEXT DEFAULT 'global'");
+  migrate("ALTER TABLE listings    ADD COLUMN visibility_id INTEGER");
+  migrate("ALTER TABLE listings    ADD COLUMN nebenkosten     TEXT");
+  migrate("ALTER TABLE listings    ADD COLUMN heizkosten      TEXT");
+  migrate("ALTER TABLE listings    ADD COLUMN kaution         TEXT");
+  migrate("ALTER TABLE listings    ADD COLUMN available_from  TEXT");
+  migrate("ALTER TABLE listings    ADD COLUMN property_type   TEXT");
+  migrate("ALTER TABLE listings    ADD COLUMN latitude        REAL");
+  migrate("ALTER TABLE listings    ADD COLUMN longitude       REAL");
+  migrate("ALTER TABLE applicant_profiles ADD COLUMN move_in_type TEXT DEFAULT 'date'");
+  migrate("ALTER TABLE applicant_profiles ADD COLUMN documents_json TEXT DEFAULT '[]'");
+  migrate("ALTER TABLE applicant_profiles ADD COLUMN household_type TEXT DEFAULT ''");
+  migrate("ALTER TABLE applicant_profiles ADD COLUMN persons INTEGER DEFAULT 0");
+  migrate("ALTER TABLE applicant_profiles ADD COLUMN children INTEGER DEFAULT 0");
+  migrate("ALTER TABLE applicant_profiles ADD COLUMN lease_duration TEXT DEFAULT ''");
+  migrate("ALTER TABLE applicant_profiles ADD COLUMN employment TEXT DEFAULT ''");
+  migrate("ALTER TABLE applicant_profiles ADD COLUMN employment_permanent INTEGER DEFAULT 0");
+  migrate("ALTER TABLE applicant_profiles ADD COLUMN income_range TEXT DEFAULT ''");
+  migrate("ALTER TABLE applicant_profiles ADD COLUMN phone TEXT DEFAULT ''");
+  migrate("ALTER TABLE applicant_profiles ADD COLUMN availability TEXT DEFAULT ''");
+  migrate("ALTER TABLE applicant_profiles ADD COLUMN share_json TEXT DEFAULT '{}'");
+  migrate("ALTER TABLE group_settings ADD COLUMN persons INTEGER DEFAULT 0");
+  migrate("ALTER TABLE group_settings ADD COLUMN children INTEGER DEFAULT 0");
+  migrate("ALTER TABLE group_settings ADD COLUMN household_type TEXT DEFAULT ''");
+  // The group's household/move-in used to live in group_settings; carry it over
+  // into the full group profile once (INSERT OR IGNORE keeps later edits).
+  migrate(`INSERT OR IGNORE INTO group_profiles (group_id, household_type, persons, children, move_in_type, move_in_date, updated_by)
+           SELECT group_id, household_type, persons, children, move_in_type, move_in_date, updated_by FROM group_settings`);
+  migrate("ALTER TABLE search_jobs ADD COLUMN visibility_id INTEGER");
+  migrate("ALTER TABLE users       ADD COLUMN notify_matrix   TEXT");
+  // Bumped on every password change/reset; sessions remember the value they
+  // were created with, so all older logins become invalid (see below).
+  migrate("ALTER TABLE users       ADD COLUMN pw_version      INTEGER DEFAULT 0");
+
+  // One-time repair: an over-eager text heuristic flagged live Kleinanzeigen ads
+  // as offline (already when they were first scraped, so there is no archive
+  // note for most of them). Put every Kleinanzeigen ad back to active except
+  // the ones a user reported by hand; the next status check re-evaluates them
+  // with the fixed detection.
+  try {
+    if (!dbGet("SELECT 1 AS x FROM app_meta WHERE key='ka_offline_repair3'")) {
+      dbRun(`UPDATE listings SET status='active'
+             WHERE platform='kleinanzeigen' AND status='offline'
+               AND id NOT IN (SELECT listing_id FROM archive_notes WHERE reason='reported')`);
+      dbRun("DELETE FROM archive_notes WHERE reason='offline' AND listing_id IN (SELECT id FROM listings WHERE status='active')");
+      dbRun("INSERT OR IGNORE INTO app_meta (key,value) VALUES ('ka_offline_repair3','1')");
+    }
+  } catch (e) { console.warn('[Migration] Kleinanzeigen-Reparatur fehlgeschlagen:', e.message); }
+
+  // One-time seed: build each user's new per-type/per-channel matrix from
+  // their old blanket toggles, so nobody's existing preferences silently
+  // reset to defaults when this feature ships.
+  try {
+    const usersNeedingSeed = dbAll("SELECT id, notify_email, notify_match, notify_new FROM users WHERE notify_matrix IS NULL OR notify_matrix = ''");
+    for (const u of usersNeedingSeed) {
+      const matrix = {
+        match:  { email: !!u.notify_email, push: true, ntfy: true },
+        new:    { email: !!u.notify_email, push: true, ntfy: true },
+        nudge:  { email: false, push: true, ntfy: true },
+        change: { email: false, push: true, ntfy: true },
+      };
+      if (!u.notify_match) matrix.match = { email: false, push: false, ntfy: false };
+      if (!u.notify_new)   matrix.new   = { email: false, push: false, ntfy: false };
+      dbRun('UPDATE users SET notify_matrix=? WHERE id=?', [JSON.stringify(matrix), u.id]);
+    }
+    if (usersNeedingSeed.length) console.log(`[Migration] Notification-Matrix für ${usersNeedingSeed.length} Nutzer angelegt`);
+  } catch (e) { console.error('[Migration] notify_matrix seed:', e.message); }
+
+  // Migrate swipes table CHECK constraint to allow 'skip' (SQLite needs table rebuild for this)
+  try {
+    const tableInfo = dbGet("SELECT sql FROM sqlite_master WHERE type='table' AND name='swipes'");
+    if (tableInfo && tableInfo.sql && !tableInfo.sql.includes("'skip'")) {
+      db.run(`
+        CREATE TABLE swipes_new (
+          id         INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id    INTEGER,
+          listing_id INTEGER,
+          action     TEXT CHECK(action IN ('like','dislike','superlike','skip')),
+          swiped_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
+          UNIQUE(user_id, listing_id)
+        );
+        INSERT INTO swipes_new SELECT * FROM swipes;
+        DROP TABLE swipes;
+        ALTER TABLE swipes_new RENAME TO swipes;
+      `);
+      console.log('[Migration] swipes-Tabelle auf "skip"-Aktion erweitert');
+    }
+  } catch (e) { console.error('[Migration] swipes table:', e.message); }
+
+  // ── Where listings come from, and the same flat on several portals ──
+  // A listing can be found by several search agents and/or added by hand; each of those is a
+  // "source", and the listing is visible to everyone who may see at least one of them.
+  // cluster_id groups copies of the same flat from different portals (see dedupe.js).
+  migrate("ALTER TABLE listings    ADD COLUMN cluster_id      INTEGER");
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS listing_sources (
+      listing_id    INTEGER NOT NULL,
+      src_key       TEXT    NOT NULL,             -- 'job:<id>' (search agent) or 'user:<id>' (added by hand)
+      job_id        INTEGER,
+      added_by      INTEGER,
+      visibility    TEXT,
+      visibility_id INTEGER,
+      added_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (listing_id, src_key)
+    );
+    CREATE INDEX IF NOT EXISTS idx_listing_sources_job ON listing_sources(job_id);
+    CREATE INDEX IF NOT EXISTS idx_listings_cluster    ON listings(cluster_id);
+    CREATE TABLE IF NOT EXISTS listing_not_duplicates (a INTEGER NOT NULL, b INTEGER NOT NULL, PRIMARY KEY (a, b));
+  `);
+  if (!dbGet("SELECT 1 FROM app_meta WHERE key='listing_sources_v1'")) {
+    // Until now a listing belonged only to whatever found it first (listings.source_job_id / visibility)
+    db.exec(`
+      INSERT OR IGNORE INTO listing_sources (listing_id, src_key, job_id)
+        SELECT id, 'job:' || source_job_id, source_job_id FROM listings WHERE source_job_id IS NOT NULL;
+      INSERT OR IGNORE INTO listing_sources (listing_id, src_key, added_by, visibility, visibility_id)
+        SELECT id, 'user:' || COALESCE(added_by, 0), added_by, COALESCE(visibility, 'global'), visibility_id
+        FROM listings WHERE source_job_id IS NULL;
+      INSERT OR REPLACE INTO app_meta (key, value) VALUES ('listing_sources_v1', datetime('now'));
+    `);
+    console.log('[Migration] Inserat-Quellen übernommen');
+  }
+  recomputeClusters();
+
+  saveDb();
+}
+
+function saveDb() {
+  try { fs.writeFileSync(dbPath, Buffer.from(db.export())); }
+  catch (e) { console.error('DB save:', e.message); }
+}
+setInterval(saveDb, 30000);
+['exit','SIGINT','SIGTERM'].forEach(sig =>
+  process.on(sig, () => { saveDb(); if (sig !== 'exit') process.exit(0); })
+);
+
+// ── DB helpers ─────────────────────────────────────────────
+function dbAll(sql, p = []) {
+  try {
+    const s = db.prepare(sql); s.bind(p);
+    const rows = []; while (s.step()) rows.push(s.getAsObject()); s.free();
+    return rows;
+  } catch (e) { console.error('dbAll:', e.message); return []; }
+}
+function dbGet(sql, p = []) { return dbAll(sql, p)[0] || null; }
+function dbRun(sql, p = []) {
+  try {
+    db.run(sql, p);
+    const r = db.exec('SELECT last_insert_rowid() as id');
+    return { lastInsertRowid: r[0] ? r[0].values[0][0] : null };
+  } catch (e) { console.error('dbRun:', e.message); throw e; }
+}
+
+// Records where a listing came from (a search agent, or someone adding it by hand).
+// Returns true when that source is new for the listing. Adding by hand again only updates
+// the visibility that person chose.
+function addListingSource(listingId, { jobId = null, addedBy = null, visibility = 'global', visibilityId = null } = {}) {
+  const key = jobId ? `job:${jobId}` : `user:${addedBy || 0}`;
+  if (dbGet('SELECT 1 FROM listing_sources WHERE listing_id=? AND src_key=?', [listingId, key])) {
+    if (!jobId) dbRun('UPDATE listing_sources SET visibility=?, visibility_id=? WHERE listing_id=? AND src_key=?',
+      [visibility, visibilityId, listingId, key]);
+    return false;
+  }
+  dbRun('INSERT INTO listing_sources (listing_id,src_key,job_id,added_by,visibility,visibility_id) VALUES (?,?,?,?,?,?)',
+    [listingId, key, jobId, jobId ? null : addedBy, jobId ? null : visibility, jobId ? null : visibilityId]);
+  return true;
+}
+
+// A URL that is already known gets the new source added instead of being skipped — before, a flat
+// stayed with whoever found it first (e.g. someone's private agent) and a group's agent never saw it.
+function insertListing(data, addedBy = null, sourceJobId = null, visibility = 'global', visibilityId = null) {
+  const source = { jobId: sourceJobId, addedBy, visibility, visibilityId };
+  const ex = dbGet('SELECT id FROM listings WHERE url=?', [data.url]);
+  if (ex) return { id: ex.id, isNew: false, linked: addListingSource(ex.id, source) };
+  const r = dbRun(
+    'INSERT INTO listings (url,title,price,price_cold,size,location,rooms,image_url,images_json,tags_json,description,platform,status,added_by,source_job_id,visibility,visibility_id,nebenkosten,heizkosten,kaution,available_from,property_type,latitude,longitude) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+    [data.url, data.title||'', data.price||'', data.price_cold||'', data.size||'',
+     data.location||'', data.rooms||'', data.image_url||'', data.images_json||'[]',
+     data.tags_json||'[]', data.description||'', data.platform||'unbekannt',
+     data.status||'active', addedBy, sourceJobId, visibility, visibilityId,
+     data.nebenkosten||'', data.heizkosten||'', data.kaution||'', data.available_from||'', data.property_type||'',
+     Number.isFinite(data.latitude) ? data.latitude : null,
+     Number.isFinite(data.longitude) ? data.longitude : null]
+  );
+  addListingSource(r.lastInsertRowid, source);
+  return { id: r.lastInsertRowid, isNew: true, linked: true };
+}
+
+// SQL condition "listing <alias> is visible to the user" — true when at least one of its sources is:
+// a search agent the user may see, or a hand-added entry shared with them. Takes visibleParams(uid).
+const visibleSql = (alias = 'l') => `EXISTS (
+  SELECT 1 FROM listing_sources src LEFT JOIN search_jobs sjv ON sjv.id = src.job_id
+  WHERE src.listing_id = ${alias}.id AND (
+    (src.job_id IS NULL AND (
+      COALESCE(src.visibility, 'global') = 'global'
+      OR (src.visibility = 'private' AND src.added_by = ?)
+      OR (src.visibility = 'group' AND src.visibility_id IN (SELECT group_id FROM group_members WHERE user_id = ?))))
+    OR (src.job_id IS NOT NULL AND (
+      sjv.visibility = 'global'
+      OR (sjv.visibility = 'private' AND sjv.added_by = ?)
+      OR (sjv.visibility = 'group' AND sjv.visibility_id IN (SELECT group_id FROM group_members WHERE user_id = ?))))))`;
+const visibleParams = uid => [uid, uid, uid, uid];
+
+// Every copy of one flat counts as one: a rating on any copy hides the others from the swipe stack.
+// "Flat key" = cluster_id for copies of the same flat on several portals, else the listing's own id.
+const SWIPED_FLATS_SQL = `SELECT COALESCE(l2.cluster_id, l2.id) FROM swipes s2 JOIN listings l2 ON l2.id = s2.listing_id
+                          WHERE s2.user_id = ? AND s2.action != 'skip'`;
+const flatKey = l => l.cluster_id || l.id;
+
+// All listing ids of the flat a listing belongs to (just itself when there are no copies)
+function flatListingIds(listingId) {
+  const l = dbGet('SELECT id, cluster_id FROM listings WHERE id=?', [listingId]);
+  if (!l) return [];
+  return l.cluster_id ? dbAll('SELECT id FROM listings WHERE cluster_id=?', [l.cluster_id]).map(r => r.id) : [l.id];
+}
+
+// The other portals the same flat is on (only copies this user may see, not offline ones)
+function attachAlsoOn(listings, uid) {
+  for (const l of listings) {
+    if (!l.cluster_id) { l.also_on = []; continue; }
+    l.also_on = dbAll(`SELECT l.id, l.platform, l.url, l.status FROM listings l
+      WHERE l.cluster_id = ? AND l.id != ? AND l.status != 'offline' AND ${visibleSql('l')} ORDER BY l.id`,
+      [l.cluster_id, l.id, ...visibleParams(uid)]);
+  }
+  return listings;
+}
+
+// Re-groups copies of the same flat (dedupe.js) and stores the result in listings.cluster_id.
+function recomputeClusters() {
+  const rows = dbAll('SELECT id,url,platform,size,rooms,price,price_cold,location,description,latitude,longitude,cluster_id FROM listings');
+  const notPairs = dbAll('SELECT a, b FROM listing_not_duplicates').map(r => [r.a, r.b]);
+  const clusters = computeClusters(rows, notPairs);
+  let changed = 0;
+  for (const r of rows) {
+    const c = clusters.get(r.id) || null;
+    if ((r.cluster_id || null) !== c) { dbRun('UPDATE listings SET cluster_id=? WHERE id=?', [c, r.id]); changed++; }
+  }
+  if (changed) console.log(`[Duplikate] ${changed} Inserate neu zugeordnet (${new Set(clusters.values()).size} Wohnungen mit Kopien auf mehreren Portalen)`);
+  return changed;
+}
+
+// ── Middleware ─────────────────────────────────────────────
+// The session secret signs every login cookie — anyone who knows it can
+// forge a session for any user. These are the placeholders that have
+// shipped in this repo's Dockerfile / docker-compose.yml / source, so
+// they're public knowledge and must never actually be used. If no real
+// secret is configured, a random one is generated once and kept next to
+// the database, so sessions still survive restarts.
+const KNOWN_DEFAULT_SECRETS = new Set([
+  'wohnungsswipe-dev-secret', 'change-me-in-production', 'aendere-mich-bitte-im-produktivbetrieb',
+  'changeme', 'secret',
+]);
+function resolveSessionSecret() {
+  const env = (process.env.SESSION_SECRET || '').trim();
+  if (env && !KNOWN_DEFAULT_SECRETS.has(env)) {
+    if (env.length < 16) console.warn('[Session] SESSION_SECRET ist sehr kurz – bitte mindestens 32 zufällige Zeichen verwenden');
+    return env;
+  }
+  if (env) console.warn('[Session] SESSION_SECRET ist ein bekannter Standardwert und wird ignoriert');
+  const file = path.join(dbDir, 'session-secret');
+  try {
+    const stored = fs.readFileSync(file, 'utf8').trim();
+    if (stored.length >= 32) return stored;
+  } catch (_) { /* not created yet */ }
+  const secret = crypto.randomBytes(48).toString('hex');
+  try { fs.writeFileSync(file, secret, { mode: 0o600 }); }
+  catch (e) { console.warn('[Session] Secret konnte nicht gespeichert werden – Sitzungen gehen beim Neustart verloren:', e.message); }
+  console.log(`[Session] Zufälliges Session-Secret erzeugt (${file})`);
+  return secret;
+}
+
+// Whether this deployment is reachable over HTTPS, inferred from BASE_URL
+// (already required to be set correctly for links in emails/push to work).
+// Defaults to false so a plain local/docker-compose setup over
+// http://localhost — where a Secure cookie would just make the browser
+// silently refuse to store it, breaking login — keeps working unchanged.
+const IS_HTTPS = (process.env.BASE_URL || '').startsWith('https://');
+if (IS_HTTPS) {
+  // Only trust the immediate reverse proxy (nginx/traefik etc. on the same
+  // host) for X-Forwarded-*, not an arbitrary chain — required for
+  // req.secure / rate limiting below to see the real client over HTTPS.
+  app.set('trust proxy', 1);
+}
+
+// Security headers (CSP intentionally left off: the app relies throughout
+// on an early inline <head> script for the no-flash theme switch, and on
+// inline style="" attributes, which a default CSP would block outright).
+app.use(helmet({ contentSecurityPolicy: false }));
+
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+app.use(express.static(path.join(__dirname, '../public')));
+app.use(session({
+  store:             new MemoryStore({ checkPeriod: 86400000 }),
+  secret:            resolveSessionSecret(),
+  resave:            false,
+  saveUninitialized: false,
+  cookie:            { maxAge: 7 * 24 * 60 * 60 * 1000, sameSite: 'lax', secure: IS_HTTPS },
+}));
+
+// Ends sessions that no longer belong to a valid login: the account was
+// deleted, or its password was changed/reset since this session was created
+// (otherwise a stolen session would outlive the victim changing their
+// password). A fresh, empty session takes its place, so the request simply
+// continues as logged-out.
+app.use((req, res, next) => {
+  if (!req.session.userId) return next();
+  const u = dbGet('SELECT pw_version FROM users WHERE id=?', [req.session.userId]);
+  if (u && (u.pw_version || 0) === (req.session.pwv || 0)) return next();
+  req.session.regenerate(err => next(err));
+});
+
+// Issues a brand-new session ID on login, so an ID that existed before
+// (e.g. planted by someone else — session fixation) never becomes logged in.
+const startSession = (req, user) => new Promise((resolve, reject) => {
+  req.session.regenerate(err => {
+    if (err) return reject(err);
+    req.session.userId   = user.id;
+    req.session.username = user.username;
+    req.session.pwv      = user.pw_version || 0;
+    resolve();
+  });
+});
+
+// Throttles brute-force / credential-stuffing attempts against auth
+// endpoints. Keyed by IP (req.ip respects the trust-proxy setting above).
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, max: 30, standardHeaders: true, legacyHeaders: false,
+  message: { error: 'Zu viele Versuche – bitte in ein paar Minuten erneut versuchen' },
+});
+// Joining by invite code: keyed by account (falls back to IP) so guessing
+// codes from one account is slow, on top of joins needing approval anyway.
+const joinLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false,
+  keyGenerator: req => (req.session?.userId ? `u${req.session.userId}` : `ip${req.ip}`),
+  message: { error: 'Zu viele Beitrittsversuche – bitte später erneut versuchen' },
+});
+// ── Per-type, per-channel notification preferences ──────────
+// Users can choose exactly which channel(s) they want for each kind of
+// notification, instead of one blanket on/off per channel. The matrix is
+// stored as JSON on users.notify_matrix; these are the defaults applied
+// whenever a type/channel combo isn't explicitly set (keeps prior
+// behaviour for anyone who hasn't touched their settings yet).
+const DEFAULT_NOTIFY_MATRIX = {
+  match:  { email: true,  push: true, ntfy: true },
+  new:    { email: true,  push: true, ntfy: true },
+  nudge:  { email: false, push: true, ntfy: true },
+  change: { email: false, push: true, ntfy: true },
+};
+
+function getNotifyMatrix(user) {
+  let stored = {};
+  try { stored = JSON.parse(user.notify_matrix || '{}'); } catch (_) { stored = {}; }
+  const merged = {};
+  for (const type of Object.keys(DEFAULT_NOTIFY_MATRIX)) {
+    merged[type] = { ...DEFAULT_NOTIFY_MATRIX[type], ...(stored[type] || {}) };
+  }
+  return merged;
+}
+
+// Combines the user's per-type preference with the "is this channel even
+// usable" technical gate — push needs an active browser subscription,
+// ntfy needs a topic configured, email just needs the toggle itself.
+function shouldNotify(user, type, channel) {
+  const matrix = getNotifyMatrix(user);
+  if (!matrix[type]?.[channel]) return false;
+  if (channel === 'push')  return !!user.notify_push;
+  if (channel === 'ntfy')  return !!user.ntfy_topic;
+  if (channel === 'email') return true;
+  return false;
+}
+
+const requireAuth = (req, res, next) =>
+  req.session.userId ? next() : res.status(401).json({ error: 'Nicht eingeloggt' });
+
+// A malformed request body (e.g. a client sending `email: {}` instead of a
+// string — whether by accident or on purpose) must never reach a
+// `.trim()`/`.toLowerCase()` call on something that isn't a string: that
+// throws, and for an `async` handler the throw becomes a rejected promise
+// that only express-async-errors catches (see the top of this file) — this
+// check means the request fails as an ordinary, logged 400 well before that.
+const isStr = v => typeof v === 'string';
+
+// ── Auth ───────────────────────────────────────────────────
+app.post('/api/auth/register', authLimiter, async (req, res) => {
+  const { username, email, password } = req.body;
+  if (!isStr(username) || !isStr(email) || !isStr(password) || !username || !email || !password)
+    return res.status(400).json({ error: 'Alle Felder erforderlich' });
+  if (password.length < 6)
+    return res.status(400).json({ error: 'Passwort mindestens 6 Zeichen' });
+  if (dbGet('SELECT id FROM users WHERE email=? OR username=?', [email.toLowerCase(), username]))
+    return res.status(409).json({ error: 'Username oder E-Mail bereits vergeben' });
+  const hash = await bcrypt.hash(password, 10);
+  const unsubToken = require('crypto').randomBytes(24).toString('hex');
+  // First user to register automatically becomes admin
+  const isFirstUser = !dbGet('SELECT id FROM users LIMIT 1');
+  const r    = dbRun('INSERT INTO users (username,email,password_hash,unsubscribe_token,is_admin) VALUES (?,?,?,?,?)',
+    [username.trim(), email.trim().toLowerCase(), hash, unsubToken, isFirstUser ? 1 : 0]);
+  saveDb();
+  await startSession(req, { id: r.lastInsertRowid, username: username.trim(), pw_version: 0 });
+  res.json({ success: true, username: username.trim(), userId: r.lastInsertRowid });
+});
+
+app.post('/api/auth/login', authLimiter, async (req, res) => {
+  const { email, password } = req.body;
+  if (!isStr(email) || !isStr(password) || !email || !password)
+    return res.status(400).json({ error: 'E-Mail und Passwort erforderlich' });
+  const user = dbGet('SELECT * FROM users WHERE email=?', [email.trim().toLowerCase()]);
+  if (!user || !await bcrypt.compare(password, user.password_hash))
+    return res.status(401).json({ error: 'Ungültige Anmeldedaten' });
+  await startSession(req, user);
+  res.json({ success: true, username: user.username, userId: user.id });
+});
+
+app.post('/api/auth/logout', (req, res) => { req.session.destroy(); res.json({ success: true }); });
+
+app.get('/api/auth/me', (req, res) => {
+  if (!req.session.userId) return res.json({ loggedIn: false });
+  const user = dbGet('SELECT id,username,email,created_at,notify_email,notify_push,notify_match,notify_new,notify_digest_interval,ntfy_topic,ntfy_server,notify_threshold,notify_matrix,is_admin FROM users WHERE id=?', [req.session.userId]);
+  if (!user) return res.json({ loggedIn: false });
+  res.json({ loggedIn: true, ...user, notify_matrix: getNotifyMatrix(user) });
+});
+
+app.get('/api/auth/stats', requireAuth, (req, res) => {
+  const rows = dbAll('SELECT action, COUNT(*) as cnt FROM swipes WHERE user_id=? GROUP BY action', [req.session.userId]);
+  const s = { likes: 0, superlikes: 0, dislikes: 0 };
+  rows.forEach(r => {
+    if (r.action === 'like')      s.likes      = r.cnt;
+    if (r.action === 'superlike') s.superlikes = r.cnt;
+    if (r.action === 'dislike')   s.dislikes   = r.cnt;
+  });
+  s.groups = dbGet('SELECT COUNT(*) as c FROM group_members WHERE user_id=?', [req.session.userId])?.c || 0;
+  res.json(s);
+});
+
+// ── Password reset ─────────────────────────────────────────
+app.post('/api/auth/forgot-password', authLimiter, async (req, res) => {
+  const { email } = req.body;
+  if (!isStr(email) || !email) return res.status(400).json({ error: 'E-Mail erforderlich' });
+  const user = dbGet('SELECT * FROM users WHERE email=?', [email.trim().toLowerCase()]);
+  // Always return success to avoid user enumeration
+  res.json({ success: true, message: 'Falls ein Account existiert, wurde eine E-Mail gesendet.' });
+  if (!user) return;
+  const token   = crypto.randomBytes(32).toString('hex');
+  const expires = new Date(Date.now() + 60 * 60 * 1000).toISOString(); // 1h
+  dbRun("UPDATE users SET reset_token=?, reset_expires=? WHERE id=?", [token, expires, user.id]);
+  saveDb();
+  await mailer.sendPasswordResetMail(user.email, user.username, token);
+});
+
+app.post('/api/auth/reset-password', authLimiter, async (req, res) => {
+  const { token, password } = req.body;
+  if (!isStr(token) || !isStr(password) || !token || !password || password.length < 6)
+    return res.status(400).json({ error: 'Ungültige Anfrage' });
+  const user = dbGet("SELECT * FROM users WHERE reset_token=?", [token]);
+  if (!user) return res.status(400).json({ error: 'Ungültiger oder abgelaufener Token' });
+  if (new Date(user.reset_expires + 'Z') < new Date())
+    return res.status(400).json({ error: 'Token abgelaufen – bitte erneut anfordern' });
+  const hash = await bcrypt.hash(password, 10);
+  // pw_version bump logs out every existing session of this account.
+  dbRun("UPDATE users SET password_hash=?, reset_token=NULL, reset_expires=NULL, pw_version=COALESCE(pw_version,0)+1 WHERE id=?", [hash, user.id]);
+  saveDb();
+  await mailer.sendPasswordChangedMail(user.email, user.username);
+  res.json({ success: true });
+});
+
+// ── User settings ──────────────────────────────────────────
+app.put('/api/user/username', requireAuth, (req, res) => {
+  const { username } = req.body;
+  if (!isStr(username) || !username.trim()) return res.status(400).json({ error: 'Username darf nicht leer sein' });
+  if (dbGet('SELECT id FROM users WHERE username=? AND id!=?', [username.trim(), req.session.userId]))
+    return res.status(409).json({ error: 'Username bereits vergeben' });
+  dbRun('UPDATE users SET username=? WHERE id=?', [username.trim(), req.session.userId]);
+  req.session.username = username.trim();
+  saveDb();
+  res.json({ success: true, username: username.trim() });
+});
+
+app.put('/api/user/email', requireAuth, authLimiter, async (req, res) => {
+  const { email, currentPassword } = req.body;
+  if (!isStr(email) || !email.includes('@')) return res.status(400).json({ error: 'Gültige E-Mail erforderlich' });
+  // The email address is where password resets go — changing it must need
+  // the password, or a briefly hijacked session becomes a permanent takeover.
+  if (!isStr(currentPassword) || !currentPassword)
+    return res.status(400).json({ error: 'Bitte aktuelles Passwort eingeben' });
+  const user = dbGet('SELECT password_hash FROM users WHERE id=?', [req.session.userId]);
+  if (!user || !await bcrypt.compare(currentPassword, user.password_hash))
+    return res.status(401).json({ error: 'Aktuelles Passwort falsch' });
+  if (dbGet('SELECT id FROM users WHERE email=? AND id!=?', [email.trim().toLowerCase(), req.session.userId]))
+    return res.status(409).json({ error: 'E-Mail bereits vergeben' });
+  dbRun('UPDATE users SET email=? WHERE id=?', [email.trim().toLowerCase(), req.session.userId]);
+  saveDb();
+  res.json({ success: true });
+});
+
+app.put('/api/user/password', requireAuth, async (req, res) => {
+  const { currentPassword, newPassword } = req.body;
+  if (!isStr(currentPassword) || !isStr(newPassword) || !currentPassword || !newPassword || newPassword.length < 6)
+    return res.status(400).json({ error: 'Ungültige Anfrage' });
+  const user = dbGet('SELECT * FROM users WHERE id=?', [req.session.userId]);
+  if (!await bcrypt.compare(currentPassword, user.password_hash))
+    return res.status(401).json({ error: 'Aktuelles Passwort falsch' });
+  const hash = await bcrypt.hash(newPassword, 10);
+  // Logs out all other sessions of this account; this one stays logged in.
+  const pwv = (user.pw_version || 0) + 1;
+  dbRun('UPDATE users SET password_hash=?, pw_version=? WHERE id=?', [hash, pwv, req.session.userId]);
+  saveDb();
+  req.session.pwv = pwv;
+  await mailer.sendPasswordChangedMail(user.email, user.username);
+  res.json({ success: true });
+});
+
+app.put('/api/user/notifications', requireAuth, (req, res) => {
+  const { notify_email, notify_push, notify_match, notify_new,
+          notify_digest_interval, ntfy_topic, ntfy_server, notify_threshold, notify_matrix } = req.body;
+  if (ntfy_server != null && !isStr(ntfy_server)) return res.status(400).json({ error: 'Ungültiger ntfy-Server' });
+  if (ntfy_topic  != null && !isStr(ntfy_topic))  return res.status(400).json({ error: 'Ungültiges ntfy-Topic' });
+  if (ntfy_server && ntfy_server.trim() && !isUrlAllowed(ntfy_server.trim()))
+    return res.status(400).json({ error: 'ntfy-Server: bitte eine öffentliche http(s)-Adresse angeben' });
+  const validIntervals = ['instant','15min','1h','6h','daily'];
+  const interval    = validIntervals.includes(notify_digest_interval) ? notify_digest_interval : 'instant';
+  const threshold   = Math.max(1, Math.min(100, parseInt(notify_threshold) || 1));
+
+  // Merge any provided matrix fields into the user's existing stored
+  // matrix (rather than replacing it wholesale), so toggling a single
+  // checkbox doesn't wipe out other type/channel preferences.
+  const current = dbGet('SELECT notify_matrix FROM users WHERE id=?', [req.session.userId]);
+  let matrixToSave = current?.notify_matrix || null;
+  if (notify_matrix && typeof notify_matrix === 'object') {
+    let existing = {};
+    try { existing = JSON.parse(current?.notify_matrix || '{}'); } catch (_) { existing = {}; }
+    for (const type of Object.keys(DEFAULT_NOTIFY_MATRIX)) {
+      if (!notify_matrix[type]) continue;
+      existing[type] = existing[type] || {};
+      for (const ch of ['email', 'push', 'ntfy']) {
+        if (typeof notify_matrix[type][ch] !== 'undefined') {
+          existing[type][ch] = !!notify_matrix[type][ch];
+        }
+      }
+    }
+    matrixToSave = JSON.stringify(existing);
+  }
+
+  dbRun('UPDATE users SET notify_email=?,notify_push=?,notify_match=?,notify_new=?,notify_digest_interval=?,ntfy_topic=?,ntfy_server=?,notify_threshold=?,notify_matrix=? WHERE id=?', [
+    notify_email ? 1 : 0, notify_push ? 1 : 0,
+    notify_match ? 1 : 0, notify_new  ? 1 : 0,
+    interval,
+    (ntfy_topic || '').trim().substring(0, 200),
+    (ntfy_server || '').trim().substring(0, 200),
+    threshold,
+    matrixToSave,
+    req.session.userId,
+  ]);
+  saveDb();
+  res.json({ success: true, notify_matrix: getNotifyMatrix({ notify_matrix: matrixToSave }) });
+});
+
+// ══════════════════════════════════════════════════════════
+//  APPLICANT PROFILE & MESSAGE GENERATION
+//  (field rules, privacy, completeness and message building live in
+//   ./profile.js; this section holds the routes and the DB access)
+// ══════════════════════════════════════════════════════════
+
+const SAMPLE_LISTING = {
+  id: 0,
+  title: 'Helle 2-Zimmer-Wohnung mit Balkon',
+  price: '850 €', price_cold: '700 €',
+  size: '58 m²', rooms: '2', location: 'Bremen Neustadt',
+};
+
+const EMPTY_PROFILE = {
+  display_name:'', occupation:'', household_size:'', household_type:'', persons:0, children:0,
+  move_in_type:'', move_in_date:'', lease_duration:'', smoker:0, pets:'',
+  employment:'', employment_permanent:0, income_range:'', documents_json:'[]',
+  about_text:'', phone:'', availability:'', formal:1, custom_template:'', share_json:'{}',
+};
+
+function getProfile(userId) {
+  const row = dbGet('SELECT * FROM applicant_profiles WHERE user_id=?', [userId]);
+  if (row) return row;
+  return { user_id: userId, _empty: true, ...EMPTY_PROFILE };
+}
+
+function profileResponse(userId) {
+  const profile = getProfile(userId);
+  return {
+    profile: { ...profile, share: P.parseShare(profile) },
+    completeness: P.completeness(profile),
+    options: P.OPTIONS,
+    shareKeys: P.SHARE_KEYS.map(({ key, label }) => ({ key, label })),
+  };
+}
+
+app.get('/api/profile', requireAuth, (req, res) => {
+  res.json(profileResponse(req.session.userId));
+});
+
+app.put('/api/profile', requireAuth, (req, res) => {
+  const uid  = req.session.userId;
+  const vals = P.normalizeInput(req.body, getProfile(uid));
+  const cols = Object.keys(vals);
+  if (dbGet('SELECT 1 FROM applicant_profiles WHERE user_id=?', [uid])) {
+    dbRun(`UPDATE applicant_profiles SET ${cols.map(c => `${c}=?`).join(',')},updated_at=CURRENT_TIMESTAMP WHERE user_id=?`,
+      [...cols.map(c => vals[c]), uid]);
+  } else {
+    dbRun(`INSERT INTO applicant_profiles (${cols.join(',')},user_id) VALUES (${cols.map(() => '?').join(',')},?)`,
+      [...cols.map(c => vals[c]), uid]);
+  }
+  saveDb();
+  res.json({ success: true, ...profileResponse(uid) });
+});
+
+// Per-user, per-group custom template. Each group member can set their own
+// template for a given group (distinct from their personal default), so a
+// WG application can read differently than a solo one. Falls back to the
+// personal custom_template, then to the guided builder, when empty.
+function getGroupTemplate(userId, groupId) {
+  const row = dbGet('SELECT template FROM group_templates WHERE user_id=? AND group_id=?', [userId, groupId]);
+  return row ? row.template : '';
+}
+
+const isGroupMember = (groupId, userId) =>
+  !!dbGet('SELECT 1 FROM group_members WHERE group_id=? AND user_id=?', [groupId, userId]);
+
+app.get('/api/groups/:id/template', requireAuth, (req, res) => {
+  const gid = req.params.id;
+  if (!isGroupMember(gid, req.session.userId)) return res.status(403).json({ error: 'Kein Zugriff' });
+  res.json({ template: getGroupTemplate(req.session.userId, gid) });
+});
+
+app.put('/api/groups/:id/template', requireAuth, (req, res) => {
+  const gid = req.params.id;
+  if (!isGroupMember(gid, req.session.userId)) return res.status(403).json({ error: 'Kein Zugriff' });
+  const tpl = (typeof req.body?.template === 'string' ? req.body.template : '').trim().substring(0, 4000);
+  const existing = dbGet('SELECT 1 FROM group_templates WHERE user_id=? AND group_id=?', [req.session.userId, gid]);
+  if (existing) {
+    dbRun('UPDATE group_templates SET template=?, updated_at=CURRENT_TIMESTAMP WHERE user_id=? AND group_id=?',
+      [tpl, req.session.userId, gid]);
+  } else {
+    dbRun('INSERT INTO group_templates (user_id, group_id, template) VALUES (?,?,?)',
+      [req.session.userId, gid, tpl]);
+  }
+  saveDb();
+  res.json({ success: true });
+});
+
+// ── Group profile ──────────────────────────────────────────
+// A group searches as "we": one shared profile holds household, move-in, pets,
+// documents, contact … Names and occupations are NOT stored here — the
+// generator takes them from the members' personal profiles.
+const GROUP_PROFILE_DEFAULTS = {
+  household_type:'', persons:0, children:0, move_in_type:'', move_in_date:'', lease_duration:'', smoker:0,
+  pets:'', income_range:'', documents_json:'[]', about_text:'', phone:'', availability:'', share_json:'{}',
+};
+
+function getGroupProfile(groupId) {
+  const row = dbGet('SELECT * FROM group_profiles WHERE group_id=?', [groupId]);
+  return row ? row : { group_id: Number(groupId), ...GROUP_PROFILE_DEFAULTS };
+}
+
+function groupMembers(groupId) {
+  return dbAll(`SELECT u.id, u.username FROM group_members gm JOIN users u ON u.id=gm.user_id
+                WHERE gm.group_id=? ORDER BY gm.joined_at`, [groupId]);
+}
+
+// The group profile has no personal blocks (name, occupation, employment come from the members).
+const groupShare = gp => { const sh = P.parseShare(gp); P.MEMBER_FED_KEYS.forEach(k => delete sh[k]); return sh; };
+
+function groupProfileResponse(groupId, userId) {
+  const gp = getGroupProfile(groupId);
+  const members = groupMembers(groupId);
+  const status = P.groupMembersStatus(members.map(m => ({ user: m, profile: getProfile(m.id) })));
+  const autoPersons = Math.max(members.length, 1);          // "automatic" = one person per group member
+  return {
+    profile: { ...gp, share: groupShare(gp) },
+    completeness: P.completenessGroup(gp),
+    options: P.OPTIONS,
+    shareKeys: P.SHARE_KEYS.filter(k => !P.MEMBER_FED_KEYS.includes(k.key)).map(({ key, label }) => ({ key, label })),
+    members: status, autoPersons, me: userId,
+  };
+}
+
+function saveGroupProfile(groupId, userId, vals) {
+  const cols = Object.keys(vals);
+  if (dbGet('SELECT 1 FROM group_profiles WHERE group_id=?', [groupId])) {
+    dbRun(`UPDATE group_profiles SET ${cols.map(c => `${c}=?`).join(',')},updated_by=?,updated_at=CURRENT_TIMESTAMP WHERE group_id=?`,
+      [...cols.map(c => vals[c]), userId, groupId]);
+  } else {
+    dbRun(`INSERT INTO group_profiles (${cols.join(',')},group_id,updated_by) VALUES (${cols.map(() => '?').join(',')},?,?)`,
+      [...cols.map(c => vals[c]), groupId, userId]);
+  }
+  saveDb();
+}
+
+app.get('/api/groups/:id/profile', requireAuth, (req, res) => {
+  if (!isGroupMember(req.params.id, req.session.userId)) return res.status(403).json({ error: 'Kein Zugriff' });
+  res.json(groupProfileResponse(req.params.id, req.session.userId));
+});
+
+// Any member may edit the shared group profile (the group is a trusted circle).
+app.put('/api/groups/:id/profile', requireAuth, (req, res) => {
+  const gid = req.params.id;
+  if (!isGroupMember(gid, req.session.userId)) return res.status(403).json({ error: 'Kein Zugriff' });
+  saveGroupProfile(gid, req.session.userId, P.normalizeGroupProfile(req.body, getGroupProfile(gid)));
+  res.json({ success: true, ...groupProfileResponse(gid, req.session.userId) });
+});
+
+// "Aus meinem Profil übernehmen": copies the caller's personal answers into the group profile.
+// By default only EMPTY group fields are filled; overwrite=true replaces everything it can.
+app.post('/api/groups/:id/profile/adopt', requireAuth, (req, res) => {
+  const gid = req.params.id;
+  if (!isGroupMember(gid, req.session.userId)) return res.status(403).json({ error: 'Kein Zugriff' });
+  const me = getProfile(req.session.userId);
+  if (!P.isFilled(me)) return res.status(400).json({ error: 'Dein persönliches Profil ist noch leer' });
+  const gp = getGroupProfile(gid);
+  const overwrite = !!req.body?.overwrite;
+  const take = {
+    household_type: me.household_type, persons: me.persons, children: me.children,
+    move_in_type: me.move_in_type, move_in_date: me.move_in_date, lease_duration: me.lease_duration,
+    pets: me.pets, income_range: me.income_range,
+    documents_json: me.documents_json, about_text: me.about_text, phone: me.phone, availability: me.availability,
+  };
+  const isEmpty = (k, v) => v === '' || v === 0 || v === null || v === undefined || (k === 'documents_json' && v === '[]');
+  const patch = {};
+  for (const [k, v] of Object.entries(take)) {
+    if (isEmpty(k, v)) continue;                        // nothing to take
+    if (overwrite || isEmpty(k, gp[k])) patch[k] = k === 'documents_json' ? JSON.parse(v) : v;
+  }
+  if (patch.documents_json) { patch.documents = patch.documents_json; delete patch.documents_json; }
+  if (overwrite || !gp.household_type) patch.smoker = me.smoker ? 1 : 0;
+  saveGroupProfile(gid, req.session.userId, P.normalizeGroupProfile(patch, gp));
+  res.json({ success: true, adopted: Object.keys(patch).length, ...groupProfileResponse(gid, req.session.userId) });
+});
+
+// Collects the profiles to use for a group message. `onlyIds` (optional)
+// restricts it to a chosen subset of members; members without a filled
+// profile are skipped and reported in `missing` (usernames).
+function collectGroupProfiles(groupId, onlyIds = null) {
+  let members = dbAll(`SELECT u.id, u.username FROM group_members gm JOIN users u ON u.id=gm.user_id
+                       WHERE gm.group_id=? ORDER BY gm.joined_at`, [groupId]);
+  if (Array.isArray(onlyIds) && onlyIds.length) {
+    const set = new Set(onlyIds.map(Number));
+    members = members.filter(m => set.has(m.id));
+  }
+  const profiles = [], missing = [];
+  for (const m of members) {
+    const pr = { ...getProfile(m.id), _username: m.username };       // fallback name when display_name is empty
+    if (P.isFilled(pr)) profiles.push(pr); else missing.push(m.username);
+  }
+  return { profiles, missing };
+}
+
+// The generator's per-message Bausteine: { household: false, … } switches a
+// block off for this message. Unknown keys / non-booleans are ignored.
+function cleanBlocks(raw) {
+  const out = {};
+  if (raw && typeof raw === 'object') {
+    for (const key of P.SHARE_KEY_NAMES) if (typeof raw[key] === 'boolean') out[key] = raw[key];
+  }
+  return out;
+}
+
+// "Erinnern": nudge a group member who hasn't filled in a profile yet.
+// Rate-limited per (sender, target, group) so it can't be used to spam.
+const _profileReminders = new Map();
+const PROFILE_REMINDER_COOLDOWN_MS = 6 * 60 * 60 * 1000;
+
+app.post('/api/groups/:id/remind-profile/:userId', requireAuth, async (req, res) => {
+  const gid    = req.params.id;
+  const target = parseInt(req.params.userId);
+  const sender = dbGet('SELECT * FROM users WHERE id=?', [req.session.userId]);
+
+  if (!isGroupMember(gid, req.session.userId)) return res.status(403).json({ error: 'Kein Zugriff' });
+  if (!isGroupMember(gid, target)) return res.status(404).json({ error: 'Nutzer nicht in dieser Gruppe' });
+  if (target === req.session.userId) return res.status(400).json({ error: 'Du kannst dich nicht selbst erinnern' });
+  if (P.isFilled(getProfile(target))) return res.status(400).json({ error: 'Dieses Mitglied hat bereits ein Profil' });
+
+  const key  = `${req.session.userId}:${target}:${gid}`;
+  const last = _profileReminders.get(key) || 0;
+  if (Date.now() - last < PROFILE_REMINDER_COOLDOWN_MS)
+    return res.status(429).json({ error: 'Du hast schon vor Kurzem erinnert – bitte später nochmal' });
+
+  const group      = dbGet('SELECT * FROM groups_table WHERE id=?', [gid]);
+  const targetUser = dbGet('SELECT * FROM users WHERE id=?', [target]);
+  if (!targetUser || !group) return res.status(404).json({ error: 'Nicht gefunden' });
+  _profileReminders.set(key, Date.now());
+
+  const title = `${sender?.username || 'Jemand'} bittet dich um dein Bewerber-Profil`;
+  const body  = `Gruppe: ${group.name} – damit eure gemeinsamen Anfragen vollständig sind.`;
+  if (shouldNotify(targetUser, 'nudge', 'push'))  await sendPushToUser(target, { title, body, url: '/?view=settings', icon: '/icon-192.png' });
+  if (shouldNotify(targetUser, 'nudge', 'ntfy'))  await sendNtfy(targetUser, title, body, 'settings');
+  if (shouldNotify(targetUser, 'nudge', 'email')) {
+    await mailer.sendProfileReminderMail(targetUser.email, targetUser.username, sender?.username || 'Jemand', group.name, targetUser.unsubscribe_token || '');
+  }
+  console.log(`[Profil-Erinnerung] ${sender?.username} → ${targetUser.username} in "${group.name}"`);
+  res.json({ success: true });
+});
+
+// Everything the generator needs for a group search: the group profile (as "we"),
+// the members that supply names/occupations, and who is missing.
+function groupSearchContext(groupId, onlyIds, blocks = {}) {
+  const col = collectGroupProfiles(groupId, onlyIds);
+  // head count = ALL members (also those not named below), so the message keeps its "we" voice
+  const gp = P.groupAsProfile(getGroupProfile(groupId), groupMembers(groupId).length);
+  return {
+    profiles: [P.visibleProfile(gp, { blocks })],
+    members:  col.profiles.map(pr => P.visibleProfile(pr, { blocks })),
+    missing:  col.missing,
+  };
+}
+
+// Live preview for the group profile page: renders the group profile exactly as posted
+// (unsaved edits) — guided, or with the given template — against a sample listing.
+app.post('/api/groups/:id/profile/preview', requireAuth, (req, res) => {
+  const gid = req.params.id;
+  if (!isGroupMember(gid, req.session.userId)) return res.status(403).json({ error: 'Kein Zugriff' });
+  const b = req.body || {};
+  const requester = getProfile(req.session.userId);
+  const col = collectGroupProfiles(gid);
+  const gp = P.groupAsProfile({ ...GROUP_PROFILE_DEFAULTS, ...P.normalizeGroupProfile(b, GROUP_PROFILE_DEFAULTS) }, groupMembers(gid).length);
+  const blocks = cleanBlocks(b.blocks);
+  const vis = [P.visibleProfile(gp, { blocks })];
+  const members = col.profiles.map(pr => P.visibleProfile(pr, { blocks }));
+  const tpl = (typeof b.template === 'string' ? b.template : '').substring(0, 4000);
+  if (b.mode === 'template' && tpl.trim()) {
+    const { text, unknown } = P.applyTemplate(tpl, P.buildPlaceholders(SAMPLE_LISTING, vis[0], vis, members, { formal: !!requester.formal }));
+    return res.json({ message: text, missingProfiles: col.missing, unknownPlaceholders: unknown,
+                      completeness: P.completenessGroup({ ...gp, documents_json: gp.documents_json }) });
+  }
+  res.json({ message: P.buildGuidedMessage(SAMPLE_LISTING, vis, requester.formal ? 1 : 0, members),
+             missingProfiles: col.missing, unknownPlaceholders: [], completeness: P.completenessGroup(gp) });
+});
+
+app.post('/api/message/generate', requireAuth, async (req, res) => {
+  const { listingId, groupId, mode, tone } = req.body || {};
+  const listing = dbGet('SELECT * FROM listings WHERE id=?', [listingId]);
+  if (!listing) return res.status(404).json({ error: 'Inserat nicht gefunden' });
+
+  // Solo search: the requester's own profile. Group search: the shared group profile
+  // ("we") plus the members' personal profiles, which only supply names and occupations;
+  // members without a profile are left out and reported in `missingProfiles`.
+  // Privacy: "In Nachricht" settings plus this message's Bausteine decide which fields
+  // reach the text (guided, template and AI).
+  const requester = getProfile(req.session.userId);
+  const blocks = cleanBlocks(req.body.blocks);
+  let profiles, members = null, missingProfiles = [];
+  if (groupId) {
+    if (!isGroupMember(groupId, req.session.userId)) return res.status(403).json({ error: 'Kein Zugriff auf diese Gruppe' });
+    const ctx = groupSearchContext(groupId, req.body.memberIds, blocks);
+    profiles = ctx.profiles; members = ctx.members; missingProfiles = ctx.missing;
+  } else {
+    profiles = [P.visibleProfile(requester, { blocks })];
+  }
+  const formal   = tone === 'formal' ? 1 : tone === 'informal' ? 0 : (requester.formal ? 1 : 0);
+
+  // ── Variant B: AI generation (only if server-side LLM creds exist) ──
+  if (mode === 'ai') {
+    if (!process.env.LLM_API_URL || !process.env.LLM_API_KEY) {
+      return res.status(400).json({ error: 'KI-Modus ist auf diesem Server nicht konfiguriert' });
+    }
+    try {
+      const profileSummary = P.summarizeForAi(profiles, members);
+
+      const prompt = `Schreibe eine höfliche, authentische deutsche Nachricht an einen Vermieter als Antwort auf eine Wohnungsanzeige. ${formal ? 'Nutze die förmliche Sie-Anrede.' : 'Nutze eine freundliche, lockere Du/Hallo-Anrede.'} Halte sie knapp (max. 150 Wörter), ehrlich und ohne übertriebene Floskeln. Verwende ausschließlich die unten genannten Angaben und erfinde nichts dazu.
+
+Sprachliche Vorgaben:
+- Schreibe „Ihre Anzeige … gelesen“, nicht „gesehen“.
+- Keine technischen Klammerzusätze wie „(59 m², 2 Zimmer)“ – Angaben zur Wohnung, wenn überhaupt, natürlich im Satz.
+- Bei einer Ausbildung den konkreten Beruf nennen („Ich absolviere eine Ausbildung als …“), nicht nur „Ich bin in Ausbildung“.
+- Beruf und Beschäftigungsart einer Person in einem Satz nennen (z. B. „Lena ist als Pflegefachfrau unbefristet angestellt“), nicht als Klammer hinter dem Namen.
+- Unterlagen „stellen wir/stelle ich gerne zur Verfügung“.
+- Telefonnummern, Ortsnamen und Zeitangaben genau so übernehmen, wie sie unten stehen.
+- Den Wunsch nach Besichtigung bzw. Rückmeldung nur einmal äußern, am Schluss.
+- Keine Platzhalter in eckigen Klammern; fehlende Angaben einfach weglassen.
+
+Anzeige:
+Titel: ${P.cleanListingTitle(listing.title)}
+Kaltmiete: ${listing.price_cold || listing.price || ''}
+Größe: ${P.formatSize(listing.size)}
+Zimmer: ${P.formatRooms(listing.rooms)}
+Lage: ${P.formatLocation(listing.location)}
+
+Bewerber:
+${profileSummary}
+
+Gib NUR den Nachrichtentext zurück, ohne Betreff, ohne Erklärungen.`;
+
+      const aiRes = await fetch(process.env.LLM_API_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${process.env.LLM_API_KEY}`,
+          ...(process.env.LLM_API_KEY_HEADER === 'x-api-key' ? { 'x-api-key': process.env.LLM_API_KEY } : {}),
+        },
+        body: JSON.stringify({
+          model: process.env.LLM_MODEL || 'gpt-4o-mini',
+          messages: [{ role: 'user', content: prompt }],
+          max_tokens: 400,
+        }),
+        timeout: 25000,
+      });
+      if (!aiRes.ok) {
+        const errTxt = await aiRes.text().catch(() => '');
+        console.warn(`[Message] KI-Fehler HTTP ${aiRes.status}: ${errTxt.substring(0, 200)}`);
+        return res.status(502).json({ error: 'KI-Dienst nicht erreichbar – nutze stattdessen die Vorlage' });
+      }
+      const data = await aiRes.json();
+      // Support both OpenAI-style and Anthropic-style response shapes
+      const text = data.choices?.[0]?.message?.content
+                || data.content?.[0]?.text
+                || data.message?.content
+                || '';
+      if (!text.trim()) return res.status(502).json({ error: 'KI lieferte keine Antwort' });
+      return res.json({ message: text.trim(), mode: 'ai', missingProfiles });
+    } catch (e) {
+      console.warn(`[Message] KI-Ausnahme: ${e.message}`);
+      return res.status(502).json({ error: 'KI-Dienst-Fehler – nutze stattdessen die Vorlage' });
+    }
+  }
+
+  // ── Variant A2: custom template with placeholders ──
+  // In a group context, a group-specific template (if the user set one)
+  // takes precedence over their personal default template.
+  if (mode === 'template') {
+    const groupTpl = groupId ? getGroupTemplate(req.session.userId, groupId) : '';
+    const tpl = (groupTpl && groupTpl.trim()) ? groupTpl : requester.custom_template;
+    if (tpl && tpl.trim()) {
+      const { text, unknown } = P.applyTemplate(tpl, P.buildPlaceholders(listing, profiles[0], profiles, members, { formal }));
+      return res.json({ message: text, mode: 'template', missingProfiles, unknownPlaceholders: unknown,
+                        templateSource: (groupTpl && groupTpl.trim()) ? 'group' : 'personal' });
+    }
+    return res.json({ message: P.buildGuidedMessage(listing, profiles, formal, members), mode: 'guided', missingProfiles,
+                      info: 'Noch keine eigene Vorlage hinterlegt – es wird die geführte Nachricht angezeigt.' });
+  }
+
+  // ── Variant A1: guided template (default) ──
+  return res.json({ message: P.buildGuidedMessage(listing, profiles, formal, members), mode: 'guided', missingProfiles });
+});
+
+// Lets the frontend know whether the AI option should be shown at all,
+// without ever exposing the key itself — plus what the generator needs to
+// render its controls: group members (with profile state), the Bausteine
+// (which blocks have data / are shared) and whether the own profile is empty.
+app.get('/api/message/capabilities', requireAuth, (req, res) => {
+  const gid = parseInt(req.query.groupId);
+  const isMember = !!gid && isGroupMember(gid, req.session.userId);
+  const hasGroupTemplate = isMember && !!getGroupTemplate(req.session.userId, gid).trim();
+  let members = null, groupProfileEmpty = false;
+  let blocks;
+  if (isMember) {
+    members = groupMembers(gid).map(m => ({ id: m.id, username: m.username, hasProfile: P.isFilled(getProfile(m.id)) }));
+    const filled = collectGroupProfiles(gid).profiles;
+    const gp = P.groupAsProfile(getGroupProfile(gid), members.length);
+    groupProfileEmpty = !P.isFilled(gp);
+    blocks = P.blockStatus([gp], filled);                 // "Vorstellung" is fed by the members' profiles
+  } else {
+    blocks = P.blockStatus([getProfile(req.session.userId)]);
+  }
+  res.json({
+    ai: !!(process.env.LLM_API_URL && process.env.LLM_API_KEY),
+    hasGroupTemplate,
+    members,
+    blocks,
+    ownProfileEmpty: !P.isFilled(getProfile(req.session.userId)),
+    groupProfileEmpty,
+  });
+});
+
+// Live preview for the settings page: renders the guided OR custom-template
+// message against a fixed SAMPLE listing, using the profile data posted in
+// the request body (so the user sees the effect of unsaved edits instantly,
+// without having to save first and open a real listing).
+app.post('/api/message/preview', requireAuth, (req, res) => {
+  const b = req.body || {};
+  const vals = P.normalizeInput(b, EMPTY_PROFILE);
+  const profile = { ...vals, display_name: vals.display_name || 'Max Mustermann' };
+  const vis = P.visibleProfile(profile, { blocks: cleanBlocks(b.blocks) });
+  let message;
+  let unknown = [];
+  if (b.mode === 'template' && profile.custom_template.trim()) {
+    const r = P.applyTemplate(profile.custom_template, P.buildPlaceholders(SAMPLE_LISTING, vis, [vis], null, { formal: !!profile.formal }));
+    message = r.text; unknown = r.unknown;
+  } else {
+    message = P.buildGuidedMessage(SAMPLE_LISTING, [vis], profile.formal);
+  }
+  res.json({ message, unknownPlaceholders: unknown, completeness: P.completeness(profile) });
+});
+
+// ── Web Push ───────────────────────────────────────────────
+app.get('/api/push/vapid-key', (req, res) => {
+  res.json({ publicKey: VAPID_PUBLIC || null });
+});
+
+app.post('/api/push/subscribe', requireAuth, (req, res) => {
+  const { endpoint, keys } = req.body;
+  if (!isStr(endpoint) || !isStr(keys?.p256dh) || !isStr(keys?.auth) || !endpoint)
+    return res.status(400).json({ error: 'Ungültige Subscription' });
+  // Real push services (FCM, Mozilla, Apple) are always public https URLs;
+  // anything else would just make this server send requests wherever the
+  // client points it.
+  if (!endpoint.startsWith('https://') || !isUrlAllowed(endpoint))
+    return res.status(400).json({ error: 'Ungültige Subscription' });
+  try {
+    dbRun('INSERT OR REPLACE INTO push_subscriptions (user_id,endpoint,p256dh,auth) VALUES (?,?,?,?)',
+      [req.session.userId, endpoint, keys.p256dh, keys.auth]);
+    saveDb();
+    res.json({ success: true });
+  } catch(e) {
+    console.error('[Push] Subscription speichern fehlgeschlagen:', e.message);
+    res.status(500).json({ error: 'Subscription konnte nicht gespeichert werden' });
+  }
+});
+
+app.post('/api/push/unsubscribe', requireAuth, (req, res) => {
+  const { endpoint } = req.body;
+  dbRun('DELETE FROM push_subscriptions WHERE user_id=? AND endpoint=?', [req.session.userId, endpoint]);
+  saveDb();
+  res.json({ success: true });
+});
+
+// ── Push sender helper ─────────────────────────────────────
+async function sendPushToUser(userId, payload) {
+  const subs = dbAll('SELECT * FROM push_subscriptions WHERE user_id=?', [userId]);
+  if (!subs.length) {
+    console.log(`[Push] Nutzer ${userId} hat keine aktive Browser-Push-Subscription (nie aktiviert oder abgelaufen)`);
+    return;
+  }
+  for (const sub of subs) {
+    try {
+      await webpush.sendNotification(
+        { endpoint: sub.endpoint, keys: { p256dh: sub.p256dh, auth: sub.auth } },
+        JSON.stringify(payload),
+        { agent: safeHttpsAgent }   // endpoint comes from the client – same SSRF guard as the scraper
+      );
+      console.log(`[Push] Gesendet an Nutzer ${userId}`);
+    } catch (e) {
+      if (e.statusCode === 410 || e.statusCode === 404) {
+        // Subscription expired – remove it
+        dbRun('DELETE FROM push_subscriptions WHERE id=?', [sub.id]);
+        saveDb();
+        console.warn(`[Push] Subscription für Nutzer ${userId} abgelaufen (HTTP ${e.statusCode}), entfernt`);
+      } else {
+        console.warn(`[Push] Fehler für user ${userId}:`, e.message);
+      }
+    }
+  }
+}
+
+// ── Notify on group match ──────────────────────────────────
+async function checkAndNotifyMatch(listingId, groupId) {
+  const memberIds = dbAll('SELECT user_id FROM group_members WHERE group_id=?', [groupId]).map(m => m.user_id);
+  if (!memberIds.length) return;
+
+  // Check if ALL members liked/superliked
+  // A like on any portal's copy of the same flat counts
+  const ids = flatListingIds(listingId);
+  if (!ids.length) return;
+  const likeCount = dbGet(
+    `SELECT COUNT(DISTINCT user_id) as c FROM swipes WHERE listing_id IN (${ids.map(()=>'?').join(',')})
+     AND user_id IN (${memberIds.map(()=>'?').join(',')}) AND action IN ('like','superlike')`,
+    [...ids, ...memberIds]
+  )?.c || 0;
+
+  if (likeCount < memberIds.length) return; // not a full match yet
+
+  const listing = dbGet('SELECT * FROM listings WHERE id=?', [listingId]);
+  const group   = dbGet('SELECT * FROM groups_table WHERE id=?', [groupId]);
+  if (!listing || !group) return;
+
+  console.log(`[Notify] Match! Gruppe "${group.name}" für Inserat "${listing.title}"`);
+
+  for (const uid of memberIds) {
+    const user = dbGet('SELECT id,username,email,notify_email,notify_push,notify_match,notify_new,ntfy_topic,ntfy_server,notify_matrix,unsubscribe_token FROM users WHERE id=?', [uid]);
+    if (!user) continue;
+
+    // Matches are always delivered immediately regardless of digest setting
+    // (matches are rare and time-sensitive)
+    if (shouldNotify(user, 'match', 'push')) {
+      await sendPushToUser(uid, {
+        title: `🎉 Match in "${group.name}"!`,
+        body:  listing.title.substring(0, 80),
+        url:   '/?view=groups',
+        icon:  '/icon-192.png',
+      });
+    }
+    if (shouldNotify(user, 'match', 'ntfy')) {
+      await sendNtfy(user, `🎉 Match in "${group.name}"!`, listing.title.substring(0, 80), 'groups');
+    }
+    if (shouldNotify(user, 'match', 'email')) {
+      await mailer.sendMatchMail(user.email, user.username, group.name, listing, user.unsubscribe_token || '');
+    }
+  }
+}
+
+// ── Listings ───────────────────────────────────────────────
+app.post('/api/listings/add', requireAuth, async (req, res) => {
+  const { url, visibility, visibility_id } = req.body;
+  if (!isStr(url) || !url) return res.status(400).json({ error: 'URL erforderlich' });
+  if (!isUrlAllowed(url)) return res.status(400).json({ error: 'Ungültige URL' });
+
+  const vis   = ['global','private','group'].includes(visibility) ? visibility : 'global';
+  const visId = vis === 'group' ? (parseInt(visibility_id) || null) : null;
+  if (vis === 'group' && visId) {
+    const member = dbGet('SELECT 1 FROM group_members WHERE group_id=? AND user_id=?', [visId, req.session.userId]);
+    if (!member) return res.status(403).json({ error: 'Nicht Mitglied dieser Gruppe' });
+  }
+
+  let listing = dbGet('SELECT * FROM listings WHERE url=?', [url]);
+  if (!listing) {
+    const scraped = await scrapeListing(url);
+    const { id } = insertListing(scraped, req.session.userId, null, vis, visId);
+    recomputeClusters();
+    listing = dbGet('SELECT * FROM listings WHERE id=?', [id]);
+  } else {
+    // already known (e.g. someone's private agent found it): now also visible as chosen here
+    addListingSource(listing.id, { addedBy: req.session.userId, visibility: vis, visibilityId: visId });
+  }
+  saveDb();
+  res.json({ success: true, listing });
+});
+
+// Listings found by a specific search agent
+app.get('/api/jobs/:id/listings', requireAuth, (req, res) => {
+  const job = dbGet('SELECT * FROM search_jobs WHERE id=?', [req.params.id]);
+  if (!job) return res.status(404).json({ error: 'Suchagent nicht gefunden' });
+
+  const uid  = req.session.userId;
+  const user = dbGet('SELECT is_admin FROM users WHERE id=?', [uid]);
+
+  // Check the requester is allowed to see this job at all
+  const canSeeJob = user?.is_admin
+    || job.visibility === 'global'
+    || job.added_by === uid
+    || (job.visibility === 'group' && dbGet(
+         'SELECT 1 FROM group_members WHERE group_id=? AND user_id=?', [job.visibility_id, uid]
+       ));
+  if (!canSeeJob) return res.status(403).json({ error: 'Kein Zugriff auf diesen Suchagenten' });
+
+  const listings = dbAll(`
+    SELECT l.*,
+      (SELECT action FROM swipes WHERE listing_id=l.id AND user_id=?) as my_swipe
+    FROM listings l
+    WHERE l.id IN (SELECT listing_id FROM listing_sources WHERE job_id = ?)
+    ORDER BY l.added_at DESC
+  `, [uid, req.params.id]);
+  res.json({ listings, job });
+});
+
+// Listings manually added by the current user (not via a search agent)
+app.get('/api/listings/mine', requireAuth, (req, res) => {
+  const listings = dbAll(`
+    SELECT l.*,
+      (SELECT action FROM swipes WHERE listing_id=l.id AND user_id=?) as my_swipe
+    FROM listings l
+    WHERE l.id IN (SELECT listing_id FROM listing_sources WHERE src_key = 'user:' || ?)
+    ORDER BY l.added_at DESC
+  `, [req.session.userId, req.session.userId]);
+  res.json({ listings });
+});
+
+// Change history for a listing (title/price/size/rooms edits detected by
+// the periodic re-check), shown in the detail view so it's clear whether
+// e.g. the price shown today is the one you originally liked.
+app.get('/api/listings/:id/changes', requireAuth, (req, res) => {
+  const changes = dbAll(
+    'SELECT field, old_value, new_value, changed_at FROM listing_changes WHERE listing_id=? ORDER BY changed_at DESC',
+    [req.params.id]
+  );
+  res.json({ changes });
+});
+
+// Change visibility of a manually-added listing (only the original adder may do this,
+// and only for listings that weren't found by a search agent).
+app.patch('/api/listings/:id/visibility', requireAuth, (req, res) => {
+  const { visibility, visibility_id } = req.body;
+  if (!['global','private','group'].includes(visibility))
+    return res.status(400).json({ error: 'Ungültige Sichtbarkeit' });
+
+  const listing = dbGet('SELECT * FROM listings WHERE id=?', [req.params.id]);
+  if (!listing) return res.status(404).json({ error: 'Inserat nicht gefunden' });
+  // Only for the entry this person added by hand (an agent's listings follow the agent's visibility)
+  const ownSource = dbGet("SELECT 1 FROM listing_sources WHERE listing_id=? AND src_key='user:' || ?", [listing.id, req.session.userId]);
+  if (!ownSource) return res.status(403).json({ error: 'Sichtbarkeit nur für selbst hinzugefügte Inserate änderbar' });
+
+  const visId = visibility === 'group' ? (parseInt(visibility_id) || null) : null;
+  if (visibility === 'group' && visId) {
+    const member = dbGet('SELECT 1 FROM group_members WHERE group_id=? AND user_id=?', [visId, req.session.userId]);
+    if (!member) return res.status(403).json({ error: 'Nicht Mitglied dieser Gruppe' });
+  }
+
+  dbRun("UPDATE listing_sources SET visibility=?, visibility_id=? WHERE listing_id=? AND src_key='user:' || ?",
+    [visibility, visId, listing.id, req.session.userId]);
+  if (listing.added_by === req.session.userId && !listing.source_job_id)        // legacy columns, kept in step
+    dbRun('UPDATE listings SET visibility=?, visibility_id=? WHERE id=?', [visibility, visId, listing.id]);
+  saveDb();
+  res.json({ success: true, visibility, visibility_id: visId });
+});
+
+// Reusable count of how many active, visible-to-this-user listings a given
+// user still has NOT swiped (like/dislike/superlike – 'skip' doesn't count
+// as done since skipped items resurface). Mirrors the exact visibility rules
+// used by GET /api/listings/swipe so the two never disagree.
+function countPendingSwipes(uid) {
+  return dbGet(`
+    SELECT COUNT(DISTINCT COALESCE(l.cluster_id, l.id)) as c FROM listings l
+    WHERE l.status = 'active'
+    AND COALESCE(l.cluster_id, l.id) NOT IN (${SWIPED_FLATS_SQL})
+    AND ${visibleSql('l')}
+  `, [uid, ...visibleParams(uid)])?.c || 0;
+}
+
+app.get('/api/listings/swipe', requireAuth, (req, res) => {
+  const uid = req.session.userId;
+  // Visible = at least one source (search agent or hand-added entry) is shared with this user, see
+  // visibleSql(). One card per flat: copies of the same flat on other portals are folded into the
+  // first-found one and listed as "also_on"; a rating on any copy removes the whole flat.
+  // Skipped flats ('skip' action) stay in the queue but are sorted to the end,
+  // so they resurface after everything else has been swiped.
+  const rows = dbAll(`
+    SELECT l.*,
+      (SELECT 1 FROM swipes sw JOIN listings lx ON lx.id = sw.listing_id
+        WHERE sw.user_id = ? AND sw.action = 'skip' AND COALESCE(lx.cluster_id, lx.id) = COALESCE(l.cluster_id, l.id) LIMIT 1) AS _skipped
+    FROM listings l
+    WHERE l.status = 'active'
+    AND COALESCE(l.cluster_id, l.id) NOT IN (${SWIPED_FLATS_SQL})
+    AND ${visibleSql('l')}
+    ORDER BY l.id
+  `, [uid, uid, ...visibleParams(uid)]);
+  const byFlat = new Map();
+  for (const r of rows) {
+    const k = flatKey(r);
+    if (!byFlat.has(k)) byFlat.set(k, { ...r, _skip_marker: r._skipped ? 'skip' : null, also_on: [] });
+    else byFlat.get(k).also_on.push({ id: r.id, platform: r.platform, url: r.url, status: r.status });
+  }
+  const listings = [...byFlat.values()];
+
+  // ── Group-priority sort ──────────────────────────────────
+  // Bring listings other group members already reacted to towards the
+  // front, so a "does anyone else like this?" signal surfaces early:
+  //   0) superliked by another group member
+  //   1) liked by another group member
+  //   2) no group signal yet (default) — newest first
+  //   3) disliked by another group member (deprioritized, but not hidden —
+  //      you might still disagree with your groupmates)
+  // Users with no groups simply get tier 2 for everything, which reduces
+  // to the previous "newest first" behaviour unchanged.
+  const otherMemberIds = dbAll(`
+    SELECT DISTINCT gm2.user_id FROM group_members gm1
+    JOIN group_members gm2 ON gm2.group_id = gm1.group_id AND gm2.user_id != gm1.user_id
+    WHERE gm1.user_id = ?
+  `, [uid]).map(r => r.user_id);
+
+  // Keyed by flat: a groupmate's rating of another portal's copy counts too
+  let groupSignalByFlat = {};
+  if (otherMemberIds.length && listings.length) {
+    const memberPh  = otherMemberIds.map(() => '?').join(',');
+    const flats = new Set(listings.map(flatKey));
+    const signals = dbAll(`
+      SELECT COALESCE(l.cluster_id, l.id) AS flat, s.action FROM swipes s JOIN listings l ON l.id = s.listing_id
+      WHERE s.user_id IN (${memberPh}) AND s.action IN ('like','superlike','dislike')
+    `, otherMemberIds);
+    for (const s of signals) {
+      if (!flats.has(s.flat)) continue;
+      const cur = groupSignalByFlat[s.flat];
+      // A flat keeps its BEST signal if groupmates disagree (any
+      // superlike beats any like, which beats an all-dislike signal).
+      const rank = { superlike: 0, like: 1, dislike: 2 }[s.action];
+      if (cur === undefined || rank < cur) groupSignalByFlat[s.flat] = rank;
+    }
+  }
+  const tierOf = (listing) => {
+    const sig = groupSignalByFlat[flatKey(listing)];
+    if (sig === 0) return 0; // superliked by groupmate
+    if (sig === 1) return 1; // liked by groupmate
+    if (sig === 2) return 3; // disliked by groupmate
+    return 2;                // no group signal — "neuste Inserate"
+  };
+
+  listings.sort((a, b) => {
+    const skipA = a._skip_marker === 'skip' ? 1 : 0;
+    const skipB = b._skip_marker === 'skip' ? 1 : 0;
+    if (skipA !== skipB) return skipA - skipB;
+    const tierA = tierOf(a), tierB = tierOf(b);
+    if (tierA !== tierB) return tierA - tierB;
+    return new Date(b.added_at + 'Z') - new Date(a.added_at + 'Z');
+  });
+
+  res.json({ listings });
+});
+
+app.post('/api/listings/swipe', requireAuth, async (req, res) => {
+  const { listingId, action } = req.body;
+  if (!['like','dislike','superlike','skip'].includes(action))
+    return res.status(400).json({ error: 'Ungültige Aktion' });
+  try { dbRun('INSERT OR REPLACE INTO swipes (user_id,listing_id,action) VALUES (?,?,?)',
+    [req.session.userId, listingId, action]); }
+  catch(e) {}
+  // One rating per flat: drop this user's ratings of the same flat's copies on other portals
+  const copies = flatListingIds(listingId).filter(id => id !== Number(listingId));
+  if (copies.length) dbRun(`DELETE FROM swipes WHERE user_id=? AND listing_id IN (${copies.map(() => '?').join(',')})`,
+    [req.session.userId, ...copies]);
+  saveDb();
+
+  // Check for group matches if this was a positive action
+  if (action === 'like' || action === 'superlike') {
+    const groups = dbAll(`
+      SELECT DISTINCT gm.group_id FROM group_members gm
+      WHERE gm.user_id=?
+    `, [req.session.userId]);
+    for (const { group_id } of groups) {
+      await checkAndNotifyMatch(listingId, group_id).catch(()=>{});
+    }
+  }
+  res.json({ success: true });
+});
+
+// Undo the most recent swipe action by this user (for "Sofort-Undo" button)
+app.post('/api/listings/swipe/undo-last', requireAuth, (req, res) => {
+  const last = dbGet('SELECT * FROM swipes WHERE user_id=? ORDER BY swiped_at DESC, id DESC LIMIT 1', [req.session.userId]);
+  if (!last) return res.status(404).json({ error: 'Keine letzte Aktion vorhanden' });
+  dbRun('DELETE FROM swipes WHERE id=?', [last.id]);
+  saveDb();
+  const listing = dbGet('SELECT * FROM listings WHERE id=?', [last.listing_id]);
+  res.json({ success: true, listing, undoneAction: last.action });
+});
+
+app.delete('/api/listings/swipe/:id', requireAuth, (req, res) => {
+  const ids = flatListingIds(req.params.id);
+  if (ids.length) dbRun(`DELETE FROM swipes WHERE user_id=? AND listing_id IN (${ids.map(() => '?').join(',')})`, [req.session.userId, ...ids]);
+  saveDb();
+  res.json({ success: true });
+});
+
+// Bulk-remove the current user's own ratings. Only the caller's swipes are
+// touched — the listings themselves and other users' ratings stay as they
+// are. Removed listings show up in the swipe queue again (same as the
+// single-delete route above).
+app.delete('/api/listings/rated', requireAuth, (req, res) => {
+  const picked = Array.isArray(req.body?.listingIds)
+    ? [...new Set(req.body.listingIds.map(Number).filter(Number.isInteger))].slice(0, 500)
+    : [];
+  if (!picked.length) return res.status(400).json({ error: 'Keine Inserate ausgewählt' });
+  const ids = [...new Set(picked.flatMap(flatListingIds))];       // the copies of each flat as well
+  if (!ids.length) return res.json({ success: true, deleted: 0 });
+
+  const ph = ids.map(() => '?').join(',');
+  const { c = 0 } = dbGet(
+    `SELECT COUNT(*) AS c FROM swipes WHERE user_id=? AND listing_id IN (${ph})`,
+    [req.session.userId, ...ids]
+  ) || {};
+  dbRun(`DELETE FROM swipes WHERE user_id=? AND listing_id IN (${ph})`, [req.session.userId, ...ids]);
+  saveDb();
+  res.json({ success: true, deleted: c });
+});
+
+// User-reported offline: lets anyone flag a listing they notice is dead
+// (expired, rented, deleted on the source site) without waiting for the
+// 6-hour auto status check. Marks it offline + archives it immediately,
+// and re-triggers the source search agent in the background so other dead
+// listings from the same job get cleared out in the same pass (the agent's
+// own redirect/404 detection does the verification — we don't blindly
+// trust a single user's report to permanently kill the listing for
+// everyone, we just archive it from the swipe/rated views right away).
+app.post('/api/listings/:id/report-offline', requireAuth, (req, res) => {
+  const id = parseInt(req.params.id);
+  const listing = dbGet('SELECT * FROM listings WHERE id=?', [id]);
+  if (!listing) return res.status(404).json({ error: 'Inserat nicht gefunden' });
+
+  // This instantly delists the listing for EVERY user, so it must stay
+  // limited to people who've actually encountered it — otherwise, since ids
+  // are sequential, any account could walk through all of them and empty
+  // out the shared listing pool for the whole instance. "Encountered" means:
+  // added it, swiped on it (like/dislike/superlike/skip), or an admin.
+  const user       = dbGet('SELECT is_admin FROM users WHERE id=?', [req.session.userId]);
+  const hasSwiped  = !!dbGet('SELECT 1 FROM swipes WHERE user_id=? AND listing_id=?', [req.session.userId, id]);
+  const isOwner    = listing.added_by === req.session.userId;
+  if (!user?.is_admin && !hasSwiped && !isOwner)
+    return res.status(403).json({ error: 'Nur wer dieses Inserat gesehen hat, kann es als offline melden' });
+
+  dbRun("UPDATE listings SET status='offline' WHERE id=?", [id]);
+  try { dbRun("INSERT OR IGNORE INTO archive_notes (listing_id,reason) VALUES (?,?)", [id, 'reported']); } catch (_) {}
+  saveDb();
+  console.log(`[Report] Nutzer ${req.session.userId} meldete Inserat ${id} ("${listing.title}") als offline`);
+
+  // Re-trigger the source agent in the background to clear sibling dead
+  // listings too. Only when the listing actually came from an agent.
+  let jobTriggered = false;
+  for (const { job_id } of dbAll('SELECT job_id FROM listing_sources WHERE listing_id=? AND job_id IS NOT NULL', [id])) {
+    const job = dbGet('SELECT * FROM search_jobs WHERE id=?', [job_id]);
+    if (job) { jobTriggered = true; runJob(job).catch(() => {}); }
+  }
+  res.json({ success: true, jobTriggered });
+});
+
+app.get('/api/listings/rated', requireAuth, (req, res) => {
+  const uid = req.session.userId;
+  // One entry per flat. Normally the copy that was rated; if that one went offline but the same flat
+  // is still listed on another portal (and visible to this user), that copy takes its place.
+  const rows = dbAll(`
+    SELECT l.*, s.action AS my_swipe, s.listing_id AS _rated_id
+    FROM swipes s
+    JOIN listings sl ON sl.id = s.listing_id
+    JOIN listings l ON (l.id = sl.id OR (sl.cluster_id IS NOT NULL AND l.cluster_id = sl.cluster_id AND ${visibleSql('l')}))
+    WHERE s.user_id = ? AND l.status != 'offline'
+    ORDER BY s.swiped_at DESC, s.id DESC, (l.id = sl.id) DESC, l.id
+  `, [...visibleParams(uid), uid]);
+  const byFlat = new Map();
+  for (const r of rows) if (!byFlat.has(flatKey(r))) byFlat.set(flatKey(r), r);
+  const listings = [...byFlat.values()];
+  for (const l of listings) {
+    // "angeschrieben" counts for the flat, whichever portal's copy it was noted on
+    const c = dbGet(`SELECT c.note FROM contacts c JOIN listings x ON x.id = c.listing_id
+      WHERE c.user_id = ? AND c.group_id IS NULL AND COALESCE(x.cluster_id, x.id) = ? LIMIT 1`, [uid, flatKey(l)]);
+    l.contacted = c ? 1 : 0; l.contact_note = c ? c.note : null;
+    delete l._rated_id;
+  }
+  res.json({ listings: attachAlsoOn(listings, uid) });
+});
+
+app.get('/api/listings/liked', requireAuth, (req, res) => {
+  const { groupId } = req.query;
+  let liked;
+  if (groupId) {
+    if (!isGroupMember(groupId, req.session.userId)) return res.status(403).json({ error: 'Kein Zugriff auf diese Gruppe' });
+    const members = dbAll('SELECT user_id FROM group_members WHERE group_id=?', [groupId]);
+    if (!members.length) return res.json({ listings: [] });
+    const ids = members.map(m => m.user_id);
+    const ph  = ids.map(()=>'?').join(',');
+    liked = dbAll(`
+      SELECT l.*,
+        COUNT(CASE WHEN s.action IN ('like','superlike') THEN 1 END) as like_count,
+        GROUP_CONCAT(CASE WHEN s.action IN ('like','superlike') THEN u.username END) as liked_by
+      FROM listings l
+      JOIN swipes s ON l.id=s.listing_id AND s.user_id IN (${ph})
+      JOIN users u ON s.user_id=u.id
+      GROUP BY l.id HAVING like_count > 0
+      ORDER BY like_count DESC, l.added_at DESC
+    `, ids);
+  } else {
+    liked = dbAll(`SELECT l.* FROM listings l JOIN swipes s ON l.id=s.listing_id
+      WHERE s.user_id=? AND s.action IN ('like','superlike') ORDER BY s.swiped_at DESC`,
+      [req.session.userId]);
+  }
+  res.json({ listings: liked || [] });
+});
+
+// Fetch a single listing by ID for the share feature — any logged-in user
+// can open a listing they were sent a direct link to, regardless of the
+// normal group/private visibility rules that govern the swipe queue.
+// Visibility there exists to keep feeds relevant, not as a privacy
+// boundary on apartment listing data, so an explicit share link
+// intentionally overrides it (same idea as "anyone with the link").
+// Registered AFTER all the more specific literal /api/listings/... routes
+// above (swipe, rated, liked, mine) so this :id wildcard doesn't shadow them.
+app.get('/api/listings/:id', requireAuth, (req, res) => {
+  if (!/^\d+$/.test(req.params.id)) return res.status(404).json({ error: 'Inserat nicht gefunden' });
+  const listing = dbGet(
+    `SELECT l.*, (SELECT action FROM swipes WHERE listing_id=l.id AND user_id=?) as my_swipe
+     FROM listings l WHERE l.id=?`,
+    [req.session.userId, req.params.id]
+  );
+  if (!listing) return res.status(404).json({ error: 'Inserat nicht gefunden' });
+  res.json({ listing: attachAlsoOn([listing], req.session.userId)[0] });
+});
+
+// "Kein Duplikat": two listings were merged as the same flat but are not – keep them apart for good.
+app.post('/api/listings/:id/not-duplicate', requireAuth, (req, res) => {
+  const a = parseInt(req.params.id), b = parseInt(req.body?.otherId);
+  if (!Number.isInteger(a) || !Number.isInteger(b) || a === b) return res.status(400).json({ error: 'Ungültige Anfrage' });
+  const la = dbGet('SELECT id, cluster_id FROM listings WHERE id=?', [a]);
+  const lb = dbGet('SELECT id, cluster_id FROM listings WHERE id=?', [b]);
+  if (!la || !lb || !la.cluster_id || la.cluster_id !== lb.cluster_id)
+    return res.status(400).json({ error: 'Diese Inserate sind nicht zusammengeführt' });
+  const uid = req.session.userId;
+  if (!dbGet(`SELECT 1 FROM listings l WHERE l.id=? AND ${visibleSql('l')}`, [a, ...visibleParams(uid)])
+      && !dbGet('SELECT 1 FROM swipes WHERE user_id=? AND listing_id IN (?,?)', [uid, a, b]))
+    return res.status(403).json({ error: 'Kein Zugriff auf dieses Inserat' });
+  dbRun('INSERT OR IGNORE INTO listing_not_duplicates (a, b) VALUES (?, ?)', [Math.min(a, b), Math.max(a, b)]);
+  recomputeClusters();
+  saveDb();
+  console.log(`[Duplikate] Nutzer ${uid}: Inserat ${a} und ${b} sind keine Duplikate`);
+  res.json({ success: true });
+});
+
+// ── Archive ───────────────────────────────────────────────
+// Returns offline listings that this user has swiped on
+app.get('/api/archive', requireAuth, (req, res) => {
+  const listings = dbAll(`
+    SELECT l.*, s.action as my_swipe,
+      an.archived_at, an.reason as archive_reason,
+      CASE WHEN c.id IS NOT NULL THEN 1 ELSE 0 END as contacted,
+      c.note as contact_note
+    FROM listings l
+    JOIN swipes s ON l.id=s.listing_id AND s.user_id=?
+    LEFT JOIN archive_notes an ON an.listing_id=l.id
+    LEFT JOIN contacts c ON c.listing_id=l.id AND c.user_id=? AND c.group_id IS NULL
+    WHERE l.status = 'offline'
+    -- still listed on another portal → it stays under "Bewertet" instead
+    AND NOT EXISTS (SELECT 1 FROM listings x WHERE x.cluster_id IS NOT NULL AND x.cluster_id = l.cluster_id
+                    AND x.status != 'offline' AND ${visibleSql('x')})
+    ORDER BY an.archived_at DESC, s.swiped_at DESC
+  `, [req.session.userId, req.session.userId, ...visibleParams(req.session.userId)]);
+  const seen = new Set();
+  res.json({ listings: listings.filter(l => !seen.has(flatKey(l)) && seen.add(flatKey(l))) });
+});
+
+// ── Contacts ───────────────────────────────────────────────
+// Mark a listing as "contacted" for current user or a group
+app.post('/api/contacts', requireAuth, (req, res) => {
+  const { listingId, groupId, note } = req.body;
+  if (!listingId) return res.status(400).json({ error: 'listingId erforderlich' });
+  if (groupId) {
+    // verify user is in group
+    if (!dbGet('SELECT 1 FROM group_members WHERE group_id=? AND user_id=?', [groupId, req.session.userId]))
+      return res.status(403).json({ error: 'Kein Zugriff auf diese Gruppe' });
+    try {
+      dbRun('INSERT OR REPLACE INTO contacts (listing_id,user_id,group_id,note,contacted_at) VALUES (?,NULL,?,?,datetime("now"))',
+        [listingId, groupId, note||'']);
+    } catch(e) { console.error('[Contacts]', e.message); return res.status(500).json({ error: 'Speichern fehlgeschlagen' }); }
+  } else {
+    try {
+      dbRun('INSERT OR REPLACE INTO contacts (listing_id,user_id,group_id,note,contacted_at) VALUES (?,?,NULL,?,datetime("now"))',
+        [listingId, req.session.userId, note||'']);
+    } catch(e) { console.error('[Contacts]', e.message); return res.status(500).json({ error: 'Speichern fehlgeschlagen' }); }
+  }
+  saveDb();
+  res.json({ success: true });
+});
+
+app.delete('/api/contacts/:listingId', requireAuth, (req, res) => {
+  const { groupId } = req.query;
+  if (groupId) {
+    if (!isGroupMember(groupId, req.session.userId)) return res.status(403).json({ error: 'Kein Zugriff auf diese Gruppe' });
+    dbRun('DELETE FROM contacts WHERE listing_id=? AND group_id=?', [req.params.listingId, groupId]);
+  } else {
+    dbRun('DELETE FROM contacts WHERE listing_id=? AND user_id=? AND group_id IS NULL', [req.params.listingId, req.session.userId]);
+  }
+  saveDb();
+  res.json({ success: true });
+});
+
+// Update note on contact
+app.patch('/api/contacts/:listingId', requireAuth, (req, res) => {
+  const { note, groupId } = req.body;
+  if (groupId) {
+    if (!isGroupMember(groupId, req.session.userId)) return res.status(403).json({ error: 'Kein Zugriff auf diese Gruppe' });
+    dbRun('UPDATE contacts SET note=? WHERE listing_id=? AND group_id=?', [note||'', req.params.listingId, groupId]);
+  } else {
+    dbRun('UPDATE contacts SET note=? WHERE listing_id=? AND user_id=? AND group_id IS NULL', [note||'', req.params.listingId, req.session.userId]);
+  }
+  saveDb();
+  res.json({ success: true });
+});
+
+// Get contact status for a listing (used by group results)
+app.get('/api/contacts/:listingId', requireAuth, (req, res) => {
+  const { groupId } = req.query;
+  let contact;
+  if (groupId) {
+    if (!isGroupMember(groupId, req.session.userId)) return res.status(403).json({ error: 'Kein Zugriff auf diese Gruppe' });
+    contact = dbGet('SELECT * FROM contacts WHERE listing_id=? AND group_id=?', [req.params.listingId, groupId]);
+  } else {
+    contact = dbGet('SELECT * FROM contacts WHERE listing_id=? AND user_id=? AND group_id IS NULL', [req.params.listingId, req.session.userId]);
+  }
+  res.json({ contact: contact || null });
+});
+
+// ── Groups ─────────────────────────────────────────────────
+app.get('/api/groups/mine', requireAuth, (req, res) => {
+  const groups = dbAll(`
+    SELECT g.*, COUNT(m2.user_id) as member_count,
+      (SELECT COUNT(*) FROM group_join_requests r WHERE r.group_id=g.id) as pending_requests
+    FROM groups_table g
+    JOIN group_members m  ON g.id=m.group_id  AND m.user_id=?
+    LEFT JOIN group_members m2 ON g.id=m2.group_id
+    GROUP BY g.id ORDER BY g.created_at DESC
+  `, [req.session.userId]);
+  // Groups this user asked to join and is still waiting on (name only –
+  // nothing else about a group is visible before being accepted).
+  const requested = dbAll(`
+    SELECT g.id, g.name, r.created_at FROM group_join_requests r
+    JOIN groups_table g ON g.id=r.group_id WHERE r.user_id=? ORDER BY r.created_at DESC
+  `, [req.session.userId]);
+  res.json({ groups, requested });
+});
+
+app.post('/api/groups/create', requireAuth, (req, res) => {
+  const { name } = req.body;
+  if (!name) return res.status(400).json({ error: 'Gruppenname erforderlich' });
+  const code = crypto.randomBytes(4).toString('hex').toUpperCase();   // 8 chars
+  const r    = dbRun('INSERT INTO groups_table (name,invite_code,created_by) VALUES (?,?,?)',
+    [name.trim(), code, req.session.userId]);
+  dbRun('INSERT INTO group_members (group_id,user_id) VALUES (?,?)', [r.lastInsertRowid, req.session.userId]);
+  saveDb();
+  res.json({ success: true, group: dbGet('SELECT * FROM groups_table WHERE id=?', [r.lastInsertRowid]) });
+});
+
+// Entering an invite code files a join request; an existing member has to
+// accept it (see /requests below) before the new person sees anything of the
+// group.
+app.post('/api/groups/join', requireAuth, joinLimiter, async (req, res) => {
+  const code  = isStr(req.body.code) ? req.body.code.trim().toUpperCase() : '';
+  const group = code && dbGet('SELECT * FROM groups_table WHERE invite_code=?', [code]);
+  if (!group) return res.status(404).json({ error: 'Gruppe nicht gefunden' });
+  const uid = req.session.userId;
+  if (isGroupMember(group.id, uid))
+    return res.json({ success: true, alreadyMember: true, group });
+  const existing = dbGet('SELECT 1 FROM group_join_requests WHERE group_id=? AND user_id=?', [group.id, uid]);
+  dbRun('INSERT OR IGNORE INTO group_join_requests (group_id,user_id) VALUES (?,?)', [group.id, uid]);
+  saveDb();
+  res.json({ success: true, pending: true, group: { id: group.id, name: group.name } });
+
+  if (existing) return;                         // don't re-notify on a repeated request
+  const requester = dbGet('SELECT username FROM users WHERE id=?', [uid]);
+  const title = 'Neue Beitrittsanfrage';
+  const body  = `${requester?.username || 'Jemand'} möchte der Gruppe „${group.name}“ beitreten`;
+  for (const { user_id } of dbAll('SELECT user_id FROM group_members WHERE group_id=?', [group.id])) {
+    const m = dbGet('SELECT * FROM users WHERE id=?', [user_id]);
+    if (!m) continue;
+    if (shouldNotify(m, 'nudge', 'push')) await sendPushToUser(m.id, { title, body, url: '/?view=groups', icon: '/icon-192.png' }).catch(() => {});
+    if (shouldNotify(m, 'nudge', 'ntfy')) await sendNtfy(m, title, body, 'groups').catch(() => {});
+  }
+});
+
+// Withdraw one's own pending request
+app.delete('/api/groups/:id/request', requireAuth, (req, res) => {
+  dbRun('DELETE FROM group_join_requests WHERE group_id=? AND user_id=?', [req.params.id, req.session.userId]);
+  saveDb();
+  res.json({ success: true });
+});
+
+// Pending requests for a group – visible to its members only
+app.get('/api/groups/:id/requests', requireAuth, (req, res) => {
+  if (!isGroupMember(req.params.id, req.session.userId)) return res.status(403).json({ error: 'Kein Zugriff' });
+  res.json({ requests: dbAll(`
+    SELECT u.id, u.username, r.created_at FROM group_join_requests r
+    JOIN users u ON u.id=r.user_id WHERE r.group_id=? ORDER BY r.created_at ASC
+  `, [req.params.id]) });
+});
+
+// Any member can accept or decline (the group is a trusted circle).
+app.post('/api/groups/:id/requests/:userId/:decision', requireAuth, async (req, res) => {
+  const gid = parseInt(req.params.id), target = parseInt(req.params.userId), decision = req.params.decision;
+  if (!['accept', 'decline'].includes(decision)) return res.status(404).json({ error: 'Unbekannte Aktion' });
+  if (!isGroupMember(gid, req.session.userId)) return res.status(403).json({ error: 'Kein Zugriff' });
+  if (!dbGet('SELECT 1 FROM group_join_requests WHERE group_id=? AND user_id=?', [gid, target]))
+    return res.status(404).json({ error: 'Anfrage nicht gefunden' });
+  dbRun('DELETE FROM group_join_requests WHERE group_id=? AND user_id=?', [gid, target]);
+  if (decision === 'accept') dbRun('INSERT OR IGNORE INTO group_members (group_id,user_id) VALUES (?,?)', [gid, target]);
+  saveDb();
+  res.json({ success: true });
+
+  if (decision !== 'accept') return;
+  const group = dbGet('SELECT name FROM groups_table WHERE id=?', [gid]);
+  const m = dbGet('SELECT * FROM users WHERE id=?', [target]);
+  if (!m || !group) return;
+  const title = 'Beitritt bestätigt', body = `Du bist jetzt Mitglied der Gruppe „${group.name}“`;
+  if (shouldNotify(m, 'nudge', 'push')) await sendPushToUser(m.id, { title, body, url: '/?view=groups', icon: '/icon-192.png' }).catch(() => {});
+  if (shouldNotify(m, 'nudge', 'ntfy')) await sendNtfy(m, title, body, 'groups').catch(() => {});
+});
+
+app.get('/api/groups/:id/members', requireAuth, (req, res) => {
+  if (!isGroupMember(req.params.id, req.session.userId)) return res.status(403).json({ error: 'Kein Zugriff' });
+  res.json({ members: dbAll(`
+    SELECT u.id,u.username,gm.joined_at FROM users u
+    JOIN group_members gm ON u.id=gm.user_id WHERE gm.group_id=?
+  `, [req.params.id]) });
+});
+
+// Member swipe status – how many listings each member still has to swipe
+app.get('/api/groups/:id/swipe-status', requireAuth, (req, res) => {
+  const gid = req.params.id;
+  if (!dbGet('SELECT 1 FROM group_members WHERE group_id=? AND user_id=?', [gid, req.session.userId]))
+    return res.status(403).json({ error: 'Kein Zugriff' });
+
+  const members = dbAll(`
+    SELECT u.id, u.username FROM users u
+    JOIN group_members gm ON u.id=gm.user_id WHERE gm.group_id=?
+  `, [gid]);
+
+  // Each member has their own visible set of listings (based on visibility
+  // rules), so "pending" must be computed per member individually rather
+  // than against one global count of all active listings.
+  const status = members.map(m => {
+    const pending = countPendingSwipes(m.id);
+    const swiped  = dbGet('SELECT COUNT(*) as c FROM swipes WHERE user_id=? AND action != ?', [m.id, 'skip'])?.c || 0;
+    return { id: m.id, username: m.username, swiped, pending };
+  });
+  res.json({ status });
+});
+
+// Nudge a group member to swipe (sends push + queues notification)
+app.post('/api/groups/:id/nudge/:userId', requireAuth, async (req, res) => {
+  const gid    = req.params.id;
+  const target = parseInt(req.params.userId);
+  const sender = dbGet('SELECT * FROM users WHERE id=?', [req.session.userId]);
+
+  if (!dbGet('SELECT 1 FROM group_members WHERE group_id=? AND user_id=?', [gid, req.session.userId]))
+    return res.status(403).json({ error: 'Kein Zugriff' });
+  if (!dbGet('SELECT 1 FROM group_members WHERE group_id=? AND user_id=?', [gid, target]))
+    return res.status(404).json({ error: 'Nutzer nicht in dieser Gruppe' });
+  if (target === req.session.userId)
+    return res.status(400).json({ error: 'Du kannst dich nicht selbst nudgen' });
+
+  const group      = dbGet('SELECT * FROM groups_table WHERE id=?', [gid]);
+  const targetUser = dbGet('SELECT * FROM users WHERE id=?', [target]);
+  if (!targetUser || !group) return res.status(404).json({ error: 'Nicht gefunden' });
+
+  const nudgeTitle = `${sender?.username || 'Jemand'} erinnert dich ans Swipen!`;
+  const nudgeBody  = `Gruppe: ${group.name}`;
+
+  if (shouldNotify(targetUser, 'nudge', 'push')) {
+    await sendPushToUser(target, { title: nudgeTitle, body: nudgeBody, url: '/', icon: '/icon-192.png' });
+  }
+  if (shouldNotify(targetUser, 'nudge', 'ntfy')) {
+    await sendNtfy(targetUser, nudgeTitle, nudgeBody);
+  }
+  if (shouldNotify(targetUser, 'nudge', 'email')) {
+    await mailer.sendNudgeMail(targetUser.email, targetUser.username, sender?.username || 'Jemand', group.name, targetUser.unsubscribe_token || '');
+  }
+
+  console.log(`[Nudge] ${sender?.username} → ${targetUser.username} in "${group.name}"`);
+  res.json({ success: true });
+});
+
+
+app.get('/api/groups/:id/results', requireAuth, (req, res) => {
+  const gid = req.params.id;
+  if (!dbGet('SELECT 1 FROM group_members WHERE group_id=? AND user_id=?', [gid, req.session.userId]))
+    return res.status(403).json({ error: 'Kein Zugriff' });
+
+  const memberIds = dbAll('SELECT user_id FROM group_members WHERE group_id=?', [gid]).map(m => m.user_id);
+  if (!memberIds.length) return res.json({ results: [], memberCount: 0 });
+  const ph = memberIds.map(()=>'?').join(',');
+
+  // Votes are counted per flat: members may have rated different portals' copies of the same flat.
+  // A member's newest rating of the flat counts. The flat is shown through a copy that is not offline.
+  const votes = dbAll(`
+    SELECT COALESCE(l.cluster_id, l.id) AS flat, s.user_id, s.action, u.username
+    FROM swipes s JOIN listings l ON l.id = s.listing_id JOIN users u ON u.id = s.user_id
+    WHERE s.user_id IN (${ph})
+    ORDER BY s.swiped_at DESC, s.id DESC
+  `, memberIds);
+  const byId = {};
+  const voted = new Set();
+  const shown = {};
+  const flats = [...new Set(votes.map(v => v.flat))];
+  if (flats.length) {
+    const fph = flats.map(() => '?').join(',');
+    for (const l of dbAll(`SELECT * FROM listings WHERE status != 'offline' AND COALESCE(cluster_id, id) IN (${fph}) ORDER BY id`, flats))
+      if (!shown[flatKey(l)]) shown[flatKey(l)] = l;
+  }
+  for (const v of votes) {
+    const l = shown[v.flat];
+    if (!l || voted.has(`${v.flat}:${v.user_id}`)) continue;
+    voted.add(`${v.flat}:${v.user_id}`);
+    if (!byId[l.id]) {
+      const c = dbGet(`SELECT c.note, c.contacted_at FROM contacts c JOIN listings x ON x.id = c.listing_id
+        WHERE c.group_id = ? AND COALESCE(x.cluster_id, x.id) = ? LIMIT 1`, [gid, v.flat]);
+      byId[l.id] = {
+        id: l.id, cluster_id: l.cluster_id, title: l.title, price: l.price, price_cold: l.price_cold,
+        size: l.size, location: l.location, rooms: l.rooms, status: l.status,
+        image_url: l.image_url, images_json: l.images_json, tags_json: l.tags_json,
+        url: l.url, platform: l.platform, votes: [], score: 0,
+        group_contacted: c ? 1 : 0, group_contact_note: c ? c.note : null, group_contacted_at: c ? c.contacted_at : null,
+      };
+    }
+    const pts = v.action === 'superlike' ? 2 : v.action === 'like' ? 1 : -1;
+    byId[l.id].votes.push({ username: v.username, action: v.action, pts });
+    byId[l.id].score += pts;
+  }
+
+  const myVotes = {};                                            // by flat, newest rating wins
+  for (const v of dbAll(`SELECT COALESCE(l.cluster_id, l.id) AS flat, s.action FROM swipes s JOIN listings l ON l.id = s.listing_id
+                         WHERE s.user_id=? ORDER BY s.swiped_at ASC, s.id ASC`, [req.session.userId])) myVotes[v.flat] = v.action;
+
+  const tierOf = (item) => {
+    const pos      = item.votes.filter(v => v.action !== 'dislike').length;
+    const neg      = item.votes.filter(v => v.action === 'dislike').length;
+    const voted    = item.votes.length;
+    // Einstimmig: alle Mitglieder haben abgestimmt UND alle positiv
+    if (neg === 0 && pos === memberIds.length) return 'einstimmig';
+    // Mehrheitlich: mehr positive als negative Stimmen
+    if (pos > neg)                             return 'mehrheitlich';
+    // Gespalten: gleich viele positive und negative
+    if (pos === neg)                           return 'gespalten';
+    return 'abgelehnt';
+  };
+
+  const order = { einstimmig: 0, mehrheitlich: 1, gespalten: 2, abgelehnt: 3 };
+  const results = Object.values(byId)
+    .map(item => ({ ...item, tier: tierOf(item), my_swipe: myVotes[flatKey(item)] || null }))
+    .sort((a, b) => order[a.tier] - order[b.tier] || b.score - a.score);
+
+  res.json({ results: attachAlsoOn(results, req.session.userId), memberCount: memberIds.length });
+});
+
+// ── Search Jobs ────────────────────────────────────────────
+app.get('/api/jobs', requireAuth, (req, res) => {
+  const uid  = req.session.userId;
+  const user = dbGet('SELECT is_admin FROM users WHERE id=?', [uid]);
+  let jobs;
+  if (user?.is_admin) {
+    // Admins see everything
+    jobs = dbAll(
+      'SELECT sj.*, u.username as owner_name FROM search_jobs sj LEFT JOIN users u ON u.id = sj.added_by ORDER BY sj.created_at DESC'
+    );
+  } else {
+    jobs = dbAll(`
+      SELECT DISTINCT sj.*, u.username as owner_name
+      FROM search_jobs sj
+      LEFT JOIN users u ON u.id = sj.added_by
+      WHERE sj.visibility = 'global'
+         OR sj.added_by = ?
+         OR (sj.visibility = 'private' AND sj.added_by = ?)
+         OR (sj.visibility = 'group' AND sj.visibility_id IN (
+              SELECT group_id FROM group_members WHERE user_id = ?
+            ))
+      ORDER BY sj.created_at DESC
+    `, [uid, uid, uid]);
+  }
+  res.json({ jobs });
+});
+
+app.post('/api/jobs', requireAuth, (req, res) => {
+  const { label, search_url, interval_min = 60 } = req.body;
+  if (!isStr(label) || !label.trim())                  return res.status(400).json({ error: 'Bezeichnung erforderlich' });
+  if (!isStr(search_url) || !search_url.startsWith('http')) return res.status(400).json({ error: 'Gültige Such-URL erforderlich' });
+  if (!isUrlAllowed(search_url)) return res.status(400).json({ error: 'Ungültige URL' });
+  const urlProblem = validateSearchUrl(search_url);
+  if (urlProblem) return res.status(400).json({ error: urlProblem });
+  if (dbGet('SELECT id FROM search_jobs WHERE search_url=?', [search_url]))
+    return res.status(409).json({ error: 'Diese Suche ist bereits vorhanden' });
+  const iv = Math.max(10, Math.min(1440, parseInt(interval_min)||60));
+  const vis   = ['global','private','group'].includes(req.body.visibility) ? req.body.visibility : 'global';
+  const visId = vis === 'group' ? (parseInt(req.body.visibility_id)||null) : null;
+  if (vis === 'group' && visId) {
+    const member = dbGet('SELECT 1 FROM group_members WHERE group_id=? AND user_id=?', [visId, req.session.userId]);
+    if (!member) return res.status(403).json({ error: 'Nicht Mitglied dieser Gruppe' });
+  }
+  const r  = dbRun('INSERT INTO search_jobs (label,search_url,platform,interval_min,added_by,visibility,visibility_id) VALUES (?,?,?,?,?,?,?)',
+    [label.trim(), search_url.trim(), detectPlatform(search_url), iv, req.session.userId, vis, visId]);
+  saveDb();
+  res.json({ success: true, job: dbGet('SELECT * FROM search_jobs WHERE id=?', [r.lastInsertRowid]) });
+});
+
+// Only the search agent's owner (or an admin) may change, pause, delete or
+// force-run it — it previously had no such check at all, so any logged-in
+// user who knew (or simply guessed, since ids are sequential) a job's id
+// could manage someone else's agent, private ones included.
+function canManageJob(job, user) {
+  return !!user?.is_admin || job.added_by === user?.id;
+}
+
+app.patch('/api/jobs/:id/toggle', requireAuth, (req, res) => {
+  const job = dbGet('SELECT * FROM search_jobs WHERE id=?', [req.params.id]);
+  if (!job) return res.status(404).json({ error: 'Job nicht gefunden' });
+  const user = dbGet('SELECT id, is_admin FROM users WHERE id=?', [req.session.userId]);
+  if (!canManageJob(job, user)) return res.status(403).json({ error: 'Kein Zugriff auf diesen Suchagenten' });
+  dbRun('UPDATE search_jobs SET active=? WHERE id=?', [job.active ? 0 : 1, job.id]);
+  saveDb();
+  res.json({ success: true, active: !job.active });
+});
+
+app.patch('/api/jobs/:id/interval', requireAuth, (req, res) => {
+  const job = dbGet('SELECT * FROM search_jobs WHERE id=?', [req.params.id]);
+  if (!job) return res.status(404).json({ error: 'Job nicht gefunden' });
+  const user = dbGet('SELECT id, is_admin FROM users WHERE id=?', [req.session.userId]);
+  if (!canManageJob(job, user)) return res.status(403).json({ error: 'Kein Zugriff auf diesen Suchagenten' });
+  const iv = Math.max(10, Math.min(1440, parseInt(req.body.interval_min)||60));
+  dbRun('UPDATE search_jobs SET interval_min=? WHERE id=?', [iv, req.params.id]);
+  saveDb();
+  res.json({ success: true, interval_min: iv });
+});
+
+app.patch('/api/jobs/:id/visibility', requireAuth, (req, res) => {
+  const job = dbGet('SELECT * FROM search_jobs WHERE id=?', [req.params.id]);
+  if (!job) return res.status(404).json({ error: 'Job nicht gefunden' });
+  const user = dbGet('SELECT id, is_admin FROM users WHERE id=?', [req.session.userId]);
+  if (!canManageJob(job, user)) return res.status(403).json({ error: 'Kein Zugriff auf diesen Suchagenten' });
+  const { visibility, visibility_id } = req.body;
+  if (!['global','private','group'].includes(visibility))
+    return res.status(400).json({ error: 'Ungültige Sichtbarkeit' });
+  const visId = visibility === 'group' ? (parseInt(visibility_id)||null) : null;
+  if (visibility === 'group' && visId) {
+    const member = dbGet('SELECT 1 FROM group_members WHERE group_id=? AND user_id=?', [visId, req.session.userId]);
+    if (!member) return res.status(403).json({ error: 'Nicht Mitglied dieser Gruppe' });
+  }
+  dbRun('UPDATE search_jobs SET visibility=?, visibility_id=? WHERE id=?', [visibility, visId, req.params.id]);
+  saveDb();
+  res.json({ success: true });
+});
+
+app.delete('/api/jobs/:id', requireAuth, (req, res) => {
+  const job = dbGet('SELECT * FROM search_jobs WHERE id=?', [req.params.id]);
+  if (!job) return res.status(404).json({ error: 'Job nicht gefunden' });
+  const user = dbGet('SELECT id, is_admin FROM users WHERE id=?', [req.session.userId]);
+  if (!canManageJob(job, user)) return res.status(403).json({ error: 'Kein Zugriff auf diesen Suchagenten' });
+  dbRun('DELETE FROM search_jobs WHERE id=?', [req.params.id]);
+  dbRun('DELETE FROM listing_sources WHERE job_id=?', [req.params.id]);
+  saveDb();
+  res.json({ success: true });
+});
+
+app.post('/api/jobs/:id/run', requireAuth, async (req, res) => {
+  const job = dbGet('SELECT * FROM search_jobs WHERE id=?', [req.params.id]);
+  if (!job) return res.status(404).json({ error: 'Job nicht gefunden' });
+  const user = dbGet('SELECT id, is_admin FROM users WHERE id=?', [req.session.userId]);
+  if (!canManageJob(job, user)) return res.status(403).json({ error: 'Kein Zugriff auf diesen Suchagenten' });
+  res.json({ success: true, message: 'Job gestartet…' });
+  runJob(job);
+});
+
+// Deletes every listing this job previously found (and anything hanging
+// off those listings: swipes, contacts, archive notes) so the next poll
+// treats every URL as brand new and re-scrapes it from scratch with the
+// current scraper logic. Useful after a scraper bug fix, to flush out
+// old listings that were saved with incorrect/garbled data.
+function resetJobListings(jobId) {
+  const all = dbAll('SELECT listing_id FROM listing_sources WHERE job_id=?', [jobId]).map(r => r.listing_id);
+  // Listings that other agents or people also brought in stay; only this agent's link goes
+  const shared = all.filter(id => dbGet('SELECT 1 FROM listing_sources WHERE listing_id=? AND src_key != ?', [id, `job:${jobId}`]));
+  const ids = all.filter(id => !shared.includes(id));
+  dbRun('DELETE FROM listing_sources WHERE job_id=?', [jobId]);
+  for (const id of shared) {
+    const next = dbGet('SELECT job_id FROM listing_sources WHERE listing_id=? AND job_id IS NOT NULL ORDER BY added_at LIMIT 1', [id]);
+    dbRun('UPDATE listings SET source_job_id=? WHERE id=? AND source_job_id=?', [next ? next.job_id : null, id, jobId]);
+  }
+  dbRun('UPDATE search_jobs SET last_run=NULL, last_error=NULL, last_new=0, total_found=0 WHERE id=?', [jobId]);
+  if (!ids.length) return 0;
+  const placeholders = ids.map(() => '?').join(',');
+  dbRun(`DELETE FROM swipes          WHERE listing_id IN (${placeholders})`, ids);
+  dbRun(`DELETE FROM contacts        WHERE listing_id IN (${placeholders})`, ids);
+  dbRun(`DELETE FROM archive_notes   WHERE listing_id IN (${placeholders})`, ids);
+  dbRun(`DELETE FROM listing_changes WHERE listing_id IN (${placeholders})`, ids);
+  dbRun(`DELETE FROM listing_sources WHERE listing_id IN (${placeholders})`, ids);
+  dbRun(`DELETE FROM listing_not_duplicates WHERE a IN (${placeholders}) OR b IN (${placeholders})`, [...ids, ...ids]);
+  dbRun(`DELETE FROM listings        WHERE id IN (${placeholders})`, ids);
+  recomputeClusters();
+  return ids.length;
+}
+
+app.post('/api/jobs/:id/reset', requireAuth, async (req, res) => {
+  const job = dbGet('SELECT * FROM search_jobs WHERE id=?', [req.params.id]);
+  if (!job) return res.status(404).json({ error: 'Job nicht gefunden' });
+  const user = dbGet('SELECT id, is_admin FROM users WHERE id=?', [req.session.userId]);
+  if (!canManageJob(job, user)) return res.status(403).json({ error: 'Kein Zugriff auf diesen Suchagenten' });
+
+  const removed = resetJobListings(job.id);
+  saveDb();
+  res.json({ success: true, removed, message: `${removed} Inserate entfernt, Suchagent wird neu gescannt…` });
+
+  const freshJob = dbGet('SELECT * FROM search_jobs WHERE id=?', [job.id]);
+  runJob(freshJob);
+});
+
+app.post('/api/jobs/reset-all', requireAuth, async (req, res) => {
+  const user = dbGet('SELECT id, is_admin FROM users WHERE id=?', [req.session.userId]);
+  const jobs = user?.is_admin
+    ? dbAll('SELECT * FROM search_jobs')
+    : dbAll('SELECT * FROM search_jobs WHERE added_by=?', [user.id]);
+
+  if (!jobs.length) return res.json({ success: true, jobCount: 0, removed: 0 });
+
+  let totalRemoved = 0;
+  for (const job of jobs) totalRemoved += resetJobListings(job.id);
+  saveDb();
+  res.json({ success: true, jobCount: jobs.length, removed: totalRemoved,
+    message: `${jobs.length} Suchagenten zurückgesetzt, ${totalRemoved} Inserate entfernt.` });
+
+  // Re-run each job in the background, spaced slightly apart so they don't
+  // all hammer external sites in the exact same instant.
+  jobs.forEach((job, i) => {
+    setTimeout(() => {
+      const freshJob = dbGet('SELECT * FROM search_jobs WHERE id=?', [job.id]);
+      if (freshJob) runJob(freshJob);
+    }, i * 2000);
+  });
+});
+
+// ── Job runner ─────────────────────────────────────────────
+// A run takes minutes (every listing is fetched with a pause) while the
+// scheduler ticks every 60s and last_run is only written at the end, so
+// without this guard the same job ran several times in parallel.
+const runningJobs = new Set();
+async function runJob(job) {
+  if (runningJobs.has(job.id)) return;
+  runningJobs.add(job.id);
+  console.log(`[Poller] Job: ${job.label}`);
+  try {
+    // A URL that is already known (from another agent or added by hand) is linked to this agent
+    // instead of being skipped, so it becomes visible to this agent's audience as well.
+    let linked = 0;
+    const insertedIds = [];
+    const { totalFound } = await pollSearchJob(
+      job,
+      (url) => {
+        const ex = dbGet('SELECT id FROM listings WHERE url=?', [url]);
+        if (ex && addListingSource(ex.id, { jobId: job.id })) linked++;
+        return !!ex;
+      },
+      (data) => { const r = insertListing(data, job.added_by, job.id); if (r.isNew) insertedIds.push(r.id); }
+    );
+    if (insertedIds.length || linked) recomputeClusters();
+    // "New" means a new flat: a copy of a flat that was already known from another portal is not
+    const inserted = new Set(insertedIds);
+    const newFlats = new Set(insertedIds.filter(id => flatListingIds(id).every(x => inserted.has(x)))
+      .map(id => flatKey(dbGet('SELECT id, cluster_id FROM listings WHERE id=?', [id]))));
+    const newCount = newFlats.size;
+    if (linked) console.log(`[Poller] ${job.label}: ${linked} bereits bekannte Inserate zusätzlich verknüpft`);
+    dbRun(`UPDATE search_jobs SET last_run=datetime('now'),last_error=NULL,last_new=?,total_found=total_found+? WHERE id=?`,
+      [newCount, newCount, job.id]);
+    saveDb();
+    console.log(`[Poller] ${job.label}: ${newCount} neue (${totalFound} auf Seite)`);
+
+    // Queue notifications – only for users who can see this job's listings
+    // AND have at least one channel enabled for "new listings" in their matrix
+    if (newCount > 0) {
+      let candidateUsers = [];
+      if (job.visibility === 'global') {
+        candidateUsers = dbAll('SELECT * FROM users');
+      } else if (job.visibility === 'private') {
+        candidateUsers = dbAll('SELECT * FROM users WHERE id=?', [job.added_by]);
+      } else if (job.visibility === 'group' && job.visibility_id) {
+        candidateUsers = dbAll(`
+          SELECT u.* FROM users u
+          JOIN group_members gm ON gm.user_id = u.id AND gm.group_id = ?
+        `, [job.visibility_id]);
+      }
+      const eligibleUsers = candidateUsers.filter(u => {
+        const m = getNotifyMatrix(u).new;
+        return m.email || m.push || m.ntfy;
+      });
+
+      for (const user of eligibleUsers) {
+        dbRun(
+          "INSERT INTO notification_queue (user_id,type,title,body,url) VALUES (?,?,?,?,?)",
+          [user.id, 'new_listings',
+           `📡 ${newCount} neue Inserate`,
+           job.label,
+           '/']
+        );
+      }
+      saveDb();
+      console.log(`[Notify] ${newCount} neue Inserate gequeued für ${eligibleUsers.length} berechtigte Nutzer (Sichtbarkeit: ${job.visibility})`);
+      // Flush immediately for users with 'instant' digest
+      await flushNotificationQueue('instant');
+    }
+  } catch (err) {
+    console.error(`[Poller] Fehler bei ${job.label}: ${err.message}`);
+    dbRun(`UPDATE search_jobs SET last_run=datetime('now'),last_error=? WHERE id=?`, [err.message, job.id]);
+    saveDb();
+  } finally {
+    runningJobs.delete(job.id);
+  }
+}
+
+// Notify users who liked/superliked a listing about something relevant
+// happening to it (price change, now reserved, etc.) — sent immediately
+// via push/ntfy, similar to match notifications, since these are rare,
+// high-value, time-sensitive events rather than a routine digest item.
+async function notifyListingWatchers(listingId, title, body) {
+  const watchers = dbAll(`
+    SELECT u.id, u.username, u.email, u.notify_push, u.notify_matrix, u.ntfy_topic, u.ntfy_server, u.unsubscribe_token
+    FROM users u
+    JOIN swipes s ON s.user_id = u.id AND s.listing_id = ? AND s.action IN ('like','superlike')
+  `, [listingId]);
+  for (const w of watchers) {
+    if (shouldNotify(w, 'change', 'push'))  await sendPushToUser(w.id, { title, body, url: '/', icon: '/icon-192.png' });
+    if (shouldNotify(w, 'change', 'ntfy'))  await sendNtfy(w, title, body);
+    if (shouldNotify(w, 'change', 'email')) await mailer.sendListingChangeMail(w.email, w.username, title, body, w.unsubscribe_token || '');
+  }
+}
+
+const CHANGE_FIELD_LABELS = {
+  title: 'Titel', price: 'Warmmiete', price_cold: 'Kaltmiete', size: 'Größe', rooms: 'Zimmer',
+};
+
+// ── Status checker (runs every 6h) ────────────────────────
+// Re-scrapes every active listing to catch two kinds of updates:
+//  1) status flips (now offline/reserved) — archives + notifies watchers
+//  2) field changes (title/price/size/rooms edited by the landlord) —
+//     recorded in listing_changes for the detail view's history, and
+//     watchers get notified about price drops or a title rewrite.
+async function runStatusCheck() {
+  const listings = dbAll("SELECT id,url,platform,title,price,price_cold,size,rooms FROM listings WHERE status='active'");
+  if (!listings.length) return;
+  console.log(`[Status] Prüfe ${listings.length} aktive Inserate…`);
+
+  const { offline, reserved, changed } = await checkExistingListings(
+    listings,
+    (id, status) => {
+      dbRun("UPDATE listings SET status=? WHERE id=?", [status, id]);
+      if (status === 'offline') {
+        try { dbRun("INSERT OR IGNORE INTO archive_notes (listing_id,reason) VALUES (?,?)", [id, 'offline']); } catch(_){}
+      }
+      saveDb();
+      console.log(`[Status] Inserat ${id} → ${status}`);
+      const listing = dbGet('SELECT title FROM listings WHERE id=?', [id]);
+      const label = status === 'reserved' ? 'jetzt reserviert' : 'jetzt offline';
+      notifyListingWatchers(id, `📌 Inserat ${label}`, listing?.title || '').catch(() => {});
+    },
+    (id, fieldChanges, fresh) => {
+      for (const { field, oldVal, newVal } of fieldChanges) {
+        dbRun('INSERT INTO listing_changes (listing_id,field,old_value,new_value) VALUES (?,?,?,?)',
+          [id, field, oldVal, newVal]);
+      }
+      const setClauses = fieldChanges.map(c => `${c.field}=?`).join(', ');
+      dbRun(`UPDATE listings SET ${setClauses} WHERE id=?`, [...fieldChanges.map(c => c.newVal), id]);
+      saveDb();
+      console.log(`[Status] Inserat ${id} geändert: ${fieldChanges.map(c => c.field).join(', ')}`);
+
+      // Only nudge watchers for the changes people actually care about —
+      // a price drop or a rewritten title, not every minor field tweak.
+      const priceChange = fieldChanges.find(c => c.field === 'price' || c.field === 'price_cold');
+      const titleChange = fieldChanges.find(c => c.field === 'title');
+      if (priceChange) {
+        const label = CHANGE_FIELD_LABELS[priceChange.field];
+        notifyListingWatchers(id, `💶 ${label} geändert`, `${fresh.title || ''}: ${priceChange.oldVal} → ${priceChange.newVal}`).catch(() => {});
+      } else if (titleChange) {
+        notifyListingWatchers(id, '✏️ Titel geändert', `${titleChange.oldVal} → ${titleChange.newVal}`).catch(() => {});
+      }
+    }
+  );
+  console.log(`[Status] ${offline||0} offline, ${reserved||0} reserviert, ${changed||0} geändert`);
+}
+
+// ── ntfy helper ───────────────────────────────────────────
+// HTTP headers only allow ASCII (RFC 7230). Emojis must be stripped from
+// Title/Message headers and expressed via ntfy's X-Tags field instead.
+const EMOJI_NTFY_TAGS = {
+  '🎉': 'tada',
+  '📡': 'satellite',
+  '📬': 'mailbox',
+  '💚': 'green_heart',
+  '⭐': 'star',
+};
+
+function stripEmojis(str) {
+  // Remove emoji and all non-ASCII characters so strings are safe for HTTP headers.
+  // We keep the \x80-\xFF range (latin-1 supplement) out as well since some HTTP
+  // implementations and intermediary proxies reject anything above 0x7E in headers.
+  return str
+    .replace(/[^\x20-\x7E]/g, '')  // strip non-printable-ASCII
+    .replace(/\s+/g, ' ')          // collapse any leftover whitespace gaps
+    .trim();
+}
+
+function extractNtfyTags(str) {
+  const tags = [];
+  for (const [emoji, tag] of Object.entries(EMOJI_NTFY_TAGS)) {
+    if (str.includes(emoji)) tags.push(tag);
+  }
+  return tags;
+}
+
+async function sendNtfy(user, title, body, view = '') {
+  if (!user.ntfy_topic) return;
+  const server    = (user.ntfy_server || '').trim() || 'https://ntfy.sh';
+  const url       = `${server}/${encodeURIComponent(user.ntfy_topic)}`;
+  // The ntfy server is user-configurable, so it gets the same protection as
+  // the scraper: refuse private/internal addresses, both up front and at
+  // connect time (see the SSRF guard in poller.js).
+  if (!isUrlAllowed(url)) {
+    console.warn(`[ntfy] Server-Adresse für Nutzer ${user.id} abgelehnt (ungültig oder intern): ${server}`);
+    return;
+  }
+  const safeTitle = stripEmojis(title) || 'WohnungsSwipe';
+  const safeBody  = stripEmojis(body)  || stripEmojis(title) || '';
+  const tags      = extractNtfyTags(title + ' ' + body);
+
+  try {
+    const res = await fetch(url, {
+      method:  'POST',
+      headers: {
+        'Title':         safeTitle,
+        'Content-Type':  'text/plain; charset=utf-8',
+        ...(tags.length ? { 'Tags': tags.join(',') } : {}),
+        ...(view ? { 'Click': `${process.env.BASE_URL || 'http://localhost:3000'}` } : {}),
+      },
+      body: safeBody,
+      timeout: 8000,
+      agent: safeAgentFor(url),
+    });
+    // fetch() only rejects on network-level failures (DNS, connection
+    // refused, timeout) — it does NOT throw on HTTP error responses like
+    // 403/500, so without this check a blocked/misconfigured/unreachable
+    // ntfy server would silently be logged as "sent" even though nothing
+    // was ever delivered.
+    if (!res.ok) {
+      const errBody = await res.text().catch(() => '');
+      console.warn(`[ntfy] Failed for user ${user.id} (HTTP ${res.status} ${res.statusText}): ${errBody.substring(0, 200)}`);
+      return;
+    }
+    console.log(`[ntfy] Sent to ${user.ntfy_topic}: ${safeTitle}`);
+  } catch (e) {
+    console.warn(`[ntfy] Failed for user ${user.id}: ${e.message}`);
+  }
+}
+
+// ── Digest flush ───────────────────────────────────────────
+// intervalKey: 'instant' | '15min' | '1h' | '6h' | 'daily'
+// Flushes queued notifications for users whose digest_interval matches
+async function flushNotificationQueue(intervalKey) {
+  const users = intervalKey === 'all'
+    ? dbAll("SELECT id,username,email,notify_email,notify_push,notify_match,notify_new,notify_digest_interval,notify_threshold,notify_matrix,ntfy_topic,ntfy_server,unsubscribe_token FROM users")
+    : dbAll("SELECT id,username,email,notify_email,notify_push,notify_match,notify_new,notify_digest_interval,notify_threshold,notify_matrix,ntfy_topic,ntfy_server,unsubscribe_token FROM users WHERE notify_digest_interval=?", [intervalKey]);
+
+  for (const user of users) {
+    const items = dbAll(
+      "SELECT * FROM notification_queue WHERE user_id=? ORDER BY created_at ASC",
+      [user.id]
+    );
+    if (!items.length) continue;
+
+    // Group items by type for a combined message
+    const newListingItems = items.filter(i => i.type === 'new_listings');
+
+    // Check threshold: count total new listings across all queued items
+    if (newListingItems.length) {
+      const totalQueued = newListingItems.reduce((s, i) => {
+        return s + parseInt(i.title.match(/\d+/)?.[0] || '1');
+      }, 0);
+      const threshold = user.notify_threshold || 1;
+      if (totalQueued < threshold) {
+        console.log(`[Digest] User ${user.username}: ${totalQueued}/${threshold} Inserate gequeued – warte auf Schwellenwert`);
+        continue; // don't flush yet
+      }
+    }
+    const otherItems      = items.filter(i => i.type !== 'new_listings');
+
+    // Build digest payload
+    let pushTitle, pushBody;
+    if (newListingItems.length === 1) {
+      pushTitle = newListingItems[0].title;
+      pushBody  = newListingItems[0].body;
+    } else if (newListingItems.length > 1) {
+      const total = newListingItems.reduce((s, i) => {
+        const n = parseInt(i.title.match(/\d+/)?.[0] || '0');
+        return s + n;
+      }, 0);
+      const sources = [...new Set(newListingItems.map(i => i.body))];
+      pushTitle = `📡 ${total} neue Inserate`;
+      pushBody  = sources.slice(0, 3).join(', ') + (sources.length > 3 ? ` +${sources.length - 3} weitere` : '');
+    }
+
+    if (pushTitle && (newListingItems.length || otherItems.length)) {
+      // Browser push
+      if (shouldNotify(user, 'new', 'push')) {
+        await sendPushToUser(user.id, { title: pushTitle, body: pushBody, url: '/', icon: '/icon-192.png' });
+      }
+      // ntfy
+      if (shouldNotify(user, 'new', 'ntfy')) {
+        await sendNtfy(user, pushTitle, pushBody);
+      }
+      // Email – only send digest email if there are enough items to justify it
+      if (shouldNotify(user, 'new', 'email')) {
+        const totalCount = newListingItems.reduce((s, i) => {
+          return s + parseInt(i.title.match(/\d+/)?.[0] || '0');
+        }, 0);
+        const sources = [...new Set(newListingItems.map(i => i.body))];
+        if (totalCount > 0) {
+          await mailer.sendNewListingsMail(
+            user.email, user.username, totalCount, sources.join(', '), user.unsubscribe_token || ''
+          );
+        }
+      }
+    }
+
+    // Delete flushed items
+    dbRun("DELETE FROM notification_queue WHERE user_id=?", [user.id]);
+    saveDb();
+    console.log(`[Digest] Flushed ${items.length} notifications for user ${user.username} (interval: ${user.notify_digest_interval})`);
+  }
+}
+
+// ── Scheduler ─────────────────────────────────────────────
+function startScheduler() {
+  // Search jobs: check every 60s
+  async function pollTick() {
+    const jobs = dbAll('SELECT * FROM search_jobs WHERE active=1');
+    for (const job of jobs) {
+      const last = job.last_run ? new Date(job.last_run + 'Z').getTime() : 0;
+      if (Date.now() >= last + job.interval_min * 60000) runJob(job);
+    }
+  }
+  setTimeout(() => { pollTick(); setInterval(pollTick, 60000); }, 15000);
+
+  // Status check: every 6 hours
+  setTimeout(() => { runStatusCheck(); setInterval(runStatusCheck, 6 * 60 * 60 * 1000); }, 5 * 60 * 1000);
+
+  // Digest flush timers
+  setInterval(() => flushNotificationQueue('15min'), 15 * 60 * 1000);
+  setInterval(() => flushNotificationQueue('1h'),    60 * 60 * 1000);
+  setInterval(() => flushNotificationQueue('6h'),     6 * 60 * 60 * 1000);
+  setInterval(() => flushNotificationQueue('daily'), 24 * 60 * 60 * 1000);
+
+  console.log('[Scheduler] Gestartet (erster Poll in 15s, erster Status-Check in 5min)');
+}
+
+// ── Admin routes ────────────────────────────────────────────────────────────
+// Self-promote works when no admins exist (first-run bootstrap)
+// After that only existing admins can promote/demote others.
+app.post('/api/admin/promote', requireAuth, (req, res) => {
+  const { targetUserId } = req.body;
+  const me       = dbGet('SELECT * FROM users WHERE id=?', [req.session.userId]);
+  const adminCount = dbGet('SELECT COUNT(*) as c FROM users WHERE is_admin=1');
+  const noAdmins = (adminCount?.c || 0) === 0;
+
+  if (!me?.is_admin && !noAdmins)
+    return res.status(403).json({ error: 'Nur Admins können andere Nutzer befördern' });
+
+  const tid    = parseInt(targetUserId) || req.session.userId;
+  const target = dbGet('SELECT * FROM users WHERE id=?', [tid]);
+  if (!target) return res.status(404).json({ error: 'Nutzer nicht gefunden' });
+
+  dbRun('UPDATE users SET is_admin=1 WHERE id=?', [target.id]);
+  saveDb();
+  res.json({ success: true, message: `${target.username} ist jetzt Admin` });
+});
+
+app.post('/api/admin/demote', requireAuth, (req, res) => {
+  const me = dbGet('SELECT * FROM users WHERE id=?', [req.session.userId]);
+  if (!me?.is_admin) return res.status(403).json({ error: 'Kein Zugriff' });
+  const { targetUserId } = req.body;
+  // Cannot demote yourself
+  if (parseInt(targetUserId) === req.session.userId)
+    return res.status(400).json({ error: 'Du kannst dir selbst keine Admin-Rechte entziehen' });
+  dbRun('UPDATE users SET is_admin=0 WHERE id=?', [targetUserId]);
+  saveDb();
+  res.json({ success: true });
+});
+
+app.get('/api/admin/users', requireAuth, (req, res) => {
+  const me = dbGet('SELECT is_admin FROM users WHERE id=?', [req.session.userId]);
+  if (!me?.is_admin) return res.status(403).json({ error: 'Kein Zugriff' });
+  const users = dbAll('SELECT id,username,email,is_admin,created_at FROM users ORDER BY created_at ASC');
+  res.json({ users });
+});
+
+// ── Email unsubscribe (no auth – token-based) ────────────────────────────────
+app.get('/api/notify/unsubscribe-email', (req, res) => {
+  const { token } = req.query;
+  if (!token) {
+    return res.send(`<!DOCTYPE html><html lang="de"><head><meta charset="UTF-8">
+    <title>Abmelden – WohnungsSwipe</title>
+    <style>body{font-family:sans-serif;background:#0f0f11;color:#f0ede8;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
+    .box{background:#18181c;border:1px solid rgba(255,255,255,.08);border-radius:16px;padding:32px;max-width:380px;text-align:center}
+    h2{color:#f05060;margin-bottom:12px}p{color:#9b9896;font-size:.9rem}</style>
+    </head><body><div class="box"><h2>Ungültiger Link</h2><p>Dieser Abmelde-Link ist nicht gültig oder bereits abgelaufen.</p></div></body></html>`);
+  }
+
+  const user = dbGet('SELECT * FROM users WHERE unsubscribe_token=?', [token]);
+  if (!user) {
+    return res.send(`<!DOCTYPE html><html lang="de"><head><meta charset="UTF-8">
+    <title>Abmelden – WohnungsSwipe</title>
+    <style>body{font-family:sans-serif;background:#0f0f11;color:#f0ede8;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
+    .box{background:#18181c;border:1px solid rgba(255,255,255,.08);border-radius:16px;padding:32px;max-width:380px;text-align:center}
+    h2{color:#f05060;margin-bottom:12px}p{color:#9b9896;font-size:.9rem}</style>
+    </head><body><div class="box"><h2>Link ungültig</h2><p>Dieser Link ist nicht mehr gültig. Du kannst Benachrichtigungen auch direkt im Profil deaktivieren.</p></div></body></html>`);
+  }
+
+  dbRun('UPDATE users SET notify_email=0 WHERE id=?', [user.id]);
+  saveDb();
+
+  res.send(`<!DOCTYPE html><html lang="de"><head><meta charset="UTF-8">
+  <title>Abgemeldet – WohnungsSwipe</title>
+  <style>body{font-family:sans-serif;background:#0f0f11;color:#f0ede8;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
+  .box{background:#18181c;border:1px solid rgba(255,255,255,.08);border-radius:16px;padding:32px;max-width:380px;text-align:center}
+  h2{color:#5bdc8a;margin-bottom:12px}p{color:#9b9896;font-size:.9rem;line-height:1.6}
+  a{color:#e8c97a}</style>
+  </head><body><div class="box">
+  <h2>✓ Abgemeldet</h2>
+  <p>Du erhältst keine E-Mail-Benachrichtigungen mehr von WohnungsSwipe.</p>
+  <p style="margin-top:16px"><a href="${process.env.BASE_URL || 'http://localhost:3000'}">Zurück zur App →</a></p>
+  </div></body></html>`);
+});
+
+// ── Password reset page ────────────────────────────────────
+app.get('/reset-password', (req, res) => {
+  res.send(`<!DOCTYPE html><html lang="de"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Passwort zurücksetzen – WohnungsSwipe</title>
+  <style>
+    body{font-family:sans-serif;background:#0f0f11;color:#f0ede8;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
+    .box{background:#18181c;border:1px solid rgba(255,255,255,.08);border-radius:16px;padding:32px;width:100%;max-width:380px}
+    h2{color:#e8c97a;margin:0 0 20px;font-size:1.3rem}
+    input{width:100%;background:#222228;border:1px solid rgba(255,255,255,.08);border-radius:10px;padding:11px 14px;color:#f0ede8;font-size:.95rem;box-sizing:border-box;margin-bottom:12px;outline:none}
+    input:focus{border-color:#e8c97a}
+    button{width:100%;background:#e8c97a;color:#0f0f11;border:none;border-radius:10px;padding:12px;font-weight:600;cursor:pointer;font-size:.95rem}
+    .msg{font-size:.85rem;margin-top:12px;min-height:1.2em}
+    .ok{color:#5bdc8a}.err{color:#f05060}
+  </style></head><body>
+  <div class="box">
+    <h2>🏠 Neues Passwort</h2>
+    <input type="password" id="pw1" placeholder="Neues Passwort" />
+    <input type="password" id="pw2" placeholder="Passwort wiederholen" />
+    <button onclick="submit()">Passwort setzen</button>
+    <div class="msg" id="msg"></div>
+  </div>
+  <script>
+    const token = new URLSearchParams(location.search).get('token');
+    async function submit() {
+      const pw1 = document.getElementById('pw1').value;
+      const pw2 = document.getElementById('pw2').value;
+      const msg = document.getElementById('msg');
+      if (!pw1 || pw1.length < 6) { msg.className='msg err'; msg.textContent='Mindestens 6 Zeichen'; return; }
+      if (pw1 !== pw2)             { msg.className='msg err'; msg.textContent='Passwörter stimmen nicht überein'; return; }
+      const r = await fetch('/api/auth/reset-password', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ token, password: pw1 })
+      }).then(r=>r.json());
+      if (r.success) {
+        msg.className='msg ok'; msg.textContent='✓ Passwort geändert – du kannst dich jetzt einloggen.';
+        setTimeout(()=>location.href='/', 2000);
+      } else {
+        msg.className='msg err'; msg.textContent=r.error||'Fehler';
+      }
+    }
+  </script>
+  </body></html>`);
+});
+
+// ── Error handling ───────────────────────────────────────────
+// Catches anything that reaches here: a synchronous throw in a route (Express
+// 4 catches those itself and forwards them), or an async handler's rejection
+// (forwarded here by express-async-errors above). Without this, Express's
+// own default error handler would still answer the request, but we want a
+// consistent JSON shape and to make sure nothing ever leaks a stack trace to
+// the client. Must be registered after all routes.
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, next) => {
+  console.error(`[Error] ${req.method} ${req.path}:`, err);
+  if (res.headersSent) return;
+  res.status(500).json({ error: 'Interner Fehler' });
+});
+
+// ── Start ──────────────────────────────────────────────────
+initDb().then(() => {
+  initVapid();
+  startScheduler();
+  app.listen(PORT, () => {
+    console.log(`🏠 WohnungsSwipe läuft auf Port ${PORT}`);
+    console.log(`   → http://localhost:${PORT}`);
+  });
+}).catch(e => { console.error('DB init failed:', e); process.exit(1); });
