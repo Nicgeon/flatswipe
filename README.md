@@ -96,7 +96,7 @@ Everything is optional; [`.env.example`](.env.example) has a commented template.
 ```bash
 npm ci
 npm test          # unit + API tests (each API test starts its own server with a temporary database)
-npm run test:ui   # plus the browser tests (needs Playwright: npm i -D playwright && npx playwright install chromium)
+npm run test:ui   # plus the browser tests (once: npx playwright install chromium)
 ```
 
 The tests never hit the real portals: `test/helpers/fake-poll.js` feeds the search agents fixed listings,

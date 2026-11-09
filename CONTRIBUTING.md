@@ -14,7 +14,7 @@ sind willkommen.
 npm ci
 npm start            # http://localhost:3000
 npm test             # Unit- und API-Tests
-npm run test:ui      # zusätzlich Browser-Tests (braucht Playwright)
+npm run test:ui      # zusätzlich Browser-Tests (einmalig: npx playwright install chromium)
 ```
 Konfiguration: siehe [.env.example](.env.example).
 

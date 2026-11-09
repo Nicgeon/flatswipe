@@ -22,5 +22,8 @@
     "nodemailer": "^10.0.16",
     "sql.js": "^1.10.3",
     "web-push": "^3.6.6"
+  },
+  "devDependencies": {
+    "playwright": "1.63.0"
   }
 }

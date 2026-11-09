@@ -53,7 +53,7 @@ function runFile(file, server, args) {
 
 (async () => {
   if (withUi && !require('./helpers/browser').available) {
-    console.error('Playwright nicht gefunden – für die Browser-Tests `npm i -D playwright && npx playwright install chromium`.');
+    console.error('Playwright nicht gefunden – `npm ci` ausführen und einmal `npx playwright install chromium`.');
     process.exit(1);
   }
   let failed = 0;

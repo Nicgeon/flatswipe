@@ -1,10 +1,10 @@
 name: Tests
 
-# Unit- und API-Tests (npm test) für Pull-Requests und Pushes auf main/testing.
+# Für Pull-Requests und Pushes auf main/testing:
+#   test – Unit- und API-Tests (npm test)
+#   ui   – Browser-Tests in Chromium (Playwright, mobil und Desktop), parallel dazu
 # Läuft im öffentlichen Repo kostenlos; PRs von Forks starten erst nach Freigabe
 # (Settings → Actions → Fork pull request workflows).
-# Die Browser-Tests (npm run test:ui) laufen hier bewusst nicht – sie brauchen
-# Playwright und sind lokal schneller.
 
 on:
   pull_request:
@@ -37,3 +37,24 @@ jobs:
 
       - run: npm ci
       - run: npm test
+
+  ui:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Node.js 22
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+      - name: Chromium für Playwright
+        run: npx playwright install --with-deps chromium
+      - name: Browser-Tests
+        run: node test/run.js --ui ui/
