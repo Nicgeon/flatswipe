@@ -1,0 +1,39 @@
+name: Tests
+
+# Unit- und API-Tests (npm test) für Pull-Requests und Pushes auf main/testing.
+# Läuft im öffentlichen Repo kostenlos; PRs von Forks starten erst nach Freigabe
+# (Settings → Actions → Fork pull request workflows).
+# Die Browser-Tests (npm run test:ui) laufen hier bewusst nicht – sie brauchen
+# Playwright und sind lokal schneller.
+
+on:
+  pull_request:
+  push:
+    branches: [main, testing]
+    paths-ignore: ['**.md', 'LICENSE', '.github/ISSUE_TEMPLATE/**']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Node.js 22
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+      - run: npm test
