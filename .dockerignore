@@ -1,0 +1,15 @@
+# Nur server/, public/, package*.json und docker-entrypoint.sh landen im Image –
+# alles andere muss nicht in den Build-Kontext.
+.git
+.github
+node_modules
+data
+test
+test-results
+playwright-report
+coverage
+*.db
+*.sqlite*
+.env
+.env.*
+*.log

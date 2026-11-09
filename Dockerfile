@@ -1,5 +1,11 @@
 FROM node:22-alpine
 
+# Verknüpft das Paket auf ghcr.io mit dem Repository (der Workflow setzt diese
+# Labels zusätzlich; hier stehen sie, damit auch lokale Builds sie tragen).
+LABEL org.opencontainers.image.source="https://github.com/Nicgeon/flatswipe" \
+      org.opencontainers.image.description="Flatswipe – selbst gehostete Wohnungssuche zum Swipen" \
+      org.opencontainers.image.licenses="MIT"
+
 # su-exec: lets the entrypoint fix volume permissions as root, then drop to
 # the unprivileged "node" user for the actual server process.
 RUN apk add --no-cache su-exec
