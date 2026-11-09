@@ -20,7 +20,7 @@
     "memorystore": "^1.6.7",
     "node-fetch": "^2.7.0",
     "nodemailer": "^10.0.16",
-    "sql.js": "^1.10.3",
+    "sql.js": "^1.15.2",
     "web-push": "^3.6.6"
   }
 }
