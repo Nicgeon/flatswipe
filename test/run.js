@@ -36,7 +36,7 @@ if (withUi) for (const size of [['390', '844'], ['1440', '900']]) TESTS.push(
   ['ui/rate-in-detail.test.js', { seed: true }, size],
   ['ui/duplicates.test.js', { plan: dupPlan }, size],
 );
-if (withUi) TESTS.push(['ui/tabs.test.js', { seed: true }], ['ui/shared-link.test.js', { seed: true }]);
+if (withUi) TESTS.push(['ui/tabs.test.js', { seed: true }], ['ui/shared-link.test.js', { seed: true }], ['ui/search-sheets.test.js', { seed: true }]);
 
 const FAILED = /^\s*✗|^\s*FAIL\b|\b[1-9]\d* (?:FAILS|failed)\b|fails: [1-9]|errors?: \[\s*"|^ERR\b|Error:/m;
 

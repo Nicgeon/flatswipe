@@ -154,60 +154,18 @@
   <div id="view-add" class="view">
     <div class="view-content">
       <div class="sub-tabs" data-subtabs></div>
-      <h2 class="view-title">Inserat hinzufügen</h2>
-      <p class="view-subtitle">Link von Kleinanzeigen, ImmobilienScout24, Immowelt, rentola, meinestadt, Vonovia, LEG oder GEWOBA einfügen.</p>
-      <div class="card-form">
-        <div class="field-group">
-          <label>Inserat-Link</label>
-          <input type="url" id="listing-url" maxlength="2000" placeholder="https://www.kleinanzeigen.de/s-anzeige/..." />
-        </div>
-        <div class="field-group">
-          <label>Sichtbarkeit</label>
-          <select id="add-visibility">
-            <option value="global">Alle Nutzer sehen dieses Inserat</option>
-            <option value="private">Nur ich (privat)</option>
-            <option value="group">Bestimmte Gruppe</option>
-          </select>
-        </div>
-        <div id="add-visibility-group-row" class="field-group" style="display:none">
-          <label>Gruppe</label>
-          <select id="add-visibility-group">
-            <option value="">Gruppe wählen…</option>
-          </select>
-        </div>
-        <button id="add-listing-btn" class="btn-primary">
-          <span id="add-btn-text">Laden &amp; hinzufügen</span>
-          <span id="add-btn-spinner" style="display:none">⏳ Lädt…</span>
-        </button>
-        <p class="form-error" id="add-error"></p>
-      </div>
-      <div id="add-preview" style="display:none">
-        <p class="section-label">Vorschau</p>
-        <div id="preview-card"></div>
-      </div>
-      <div class="card-form" style="margin-top:16px">
-        <p class="section-label">Unterstützte Portale</p>
-        <div class="chip-row">
-          <span class="chip">kleinanzeigen.de</span>
-          <span class="chip">immobilienscout24.de</span>
-          <span class="chip">immowelt.de</span>
-          <span class="chip">rentola.de</span>
-          <span class="chip">meinestadt.de</span>
-          <span class="chip">vonovia.de</span>
-          <span class="chip">leg-wohnen.de</span>
-          <span class="chip">gewoba.de</span>
-        </div>
-      </div>
-
-      <div class="rated-header" style="margin-top:20px">
+      <div class="page-head">
         <div>
-          <p class="section-label" style="margin-bottom:0">Meine hinzugefügten Inserate</p>
+          <h2 class="view-title">Hinzugefügte Inserate</h2>
+          <p class="view-subtitle">Einzelne Inserate per Link – ohne Suchagent.</p>
         </div>
+        <button class="btn-primary btn-compact" data-open-sheet="add-sheet"><span class="i sm" data-icon="plus"></span>Link</button>
       </div>
       <div id="my-added-list" class="listings-grid rc-grid"></div>
       <div id="my-added-empty" class="empty-state" style="display:none">
         <div class="empty-icon i" data-icon="addbox"></div>
         <p>Du hast noch keine Inserate manuell hinzugefügt.</p>
+        <button class="btn-primary empty-action" data-open-sheet="add-sheet"><span class="i sm" data-icon="plus"></span>Inserat per Link hinzufügen</button>
       </div>
     </div>
   </div>
@@ -360,54 +318,12 @@
   <div id="view-jobs" class="view">
     <div class="view-content">
       <div class="sub-tabs" data-subtabs></div>
-      <h2 class="view-title">Suchagenten</h2>
-      <p class="view-subtitle">Suchergebnis-URL eintragen – neue Inserate werden automatisch geladen.</p>
-      <div class="card-form">
-        <div class="field-group">
-          <label>Bezeichnung</label>
-          <input type="text" id="job-label" maxlength="100" placeholder="z.B. Berlin 2-Zimmer bis 1200€" />
+      <div class="page-head">
+        <div>
+          <h2 class="view-title">Suchagenten</h2>
+          <p class="view-subtitle">Beobachten Suchergebnisse und holen neue Inserate automatisch.</p>
         </div>
-        <div class="field-group">
-          <label>Such-URL (Suchergebnisseite)</label>
-          <input type="url" id="job-url" maxlength="2000" placeholder="https://www.kleinanzeigen.de/s-wohnung-mieten/berlin/c203l3331" />
-        </div>
-        <div class="field-group" style="max-width:180px">
-          <label>Intervall (Minuten)</label>
-          <input type="number" id="job-interval" value="60" min="10" max="1440" />
-        </div>
-        <div class="field-group">
-          <label>Sichtbarkeit</label>
-          <select id="job-visibility">
-            <option value="global">Alle Nutzer sehen diese Inserate</option>
-            <option value="private">Nur ich (privat)</option>
-            <option value="group">Bestimmte Gruppe</option>
-          </select>
-        </div>
-        <div id="job-visibility-group-row" class="field-group" style="display:none">
-          <label>Gruppe</label>
-          <select id="job-visibility-group">
-            <option value="">Gruppe wählen…</option>
-          </select>
-        </div>
-        <button id="job-add-btn" class="btn-primary">
-          <span id="job-add-text">Suchagent hinzufügen</span>
-          <span id="job-add-spinner" style="display:none">⏳ …</span>
-        </button>
-        <p class="form-error" id="job-error"></p>
-      </div>
-
-      <div class="card-form hint-card">
-        <p class="section-label">So bekommst du eine Such-URL</p>
-        <div class="hint-list">
-          <div class="hint-item"><strong>Kleinanzeigen</strong> – Suche filtern (Ort, Preis, Zimmer) → URL aus der Adressleiste kopieren.</div>
-          <div class="hint-item"><strong>ImmobilienScout24</strong> – Suchergebnisse filtern → URL kopieren.</div>
-          <div class="hint-item"><strong>Immowelt</strong> – Suchergebnisse filtern → URL kopieren.</div>
-          <div class="hint-item"><strong>rentola</strong> – Suchergebnisse filtern → URL kopieren.</div>
-          <div class="hint-item"><strong>meinestadt</strong> – Suchergebnisse filtern → URL kopieren.</div>
-          <div class="hint-item"><strong>LEG</strong> – auf leg-wohnen.de unter „Mietwohnungen“ die Region öffnen (z. B. …/mietwohnungen/bremen) → URL kopieren.</div>
-          <div class="hint-item"><strong>GEWOBA</strong> – die Wohnungssuche öffnen (gewoba.de/immobilien/mieten/wohnungssuche) → URL kopieren. Der Agent beobachtet alle aktuellen Angebote.</div>
-          <div class="hint-item"><strong>Vonovia</strong> – auf vonovia.de unter „Zuhause finden“ Ort und Filter einstellen → URL der Ergebnisseite kopieren.</div>
-        </div>
+        <button class="btn-primary btn-compact" data-open-sheet="job-sheet"><span class="i sm" data-icon="plus"></span>Neu</button>
       </div>
 
       <div class="jobs-list-header" id="jobs-list-header" style="display:none">
@@ -418,7 +334,7 @@
       <div id="jobs-empty" class="empty-state" style="display:none">
         <div class="empty-icon i" data-icon="agent"></div>
         <p>Noch keine Suchagenten.</p>
-        <p class="empty-sub">Trage oben eine Suchergebnis-URL ein.</p>
+        <button class="btn-primary empty-action" data-open-sheet="job-sheet"><span class="i sm" data-icon="plus"></span>Ersten Suchagenten einrichten</button>
       </div>
     </div>
   </div>
@@ -834,6 +750,112 @@
       <button class="btn-primary" id="confirm-join">Anfrage senden</button>
     </div>
     <p class="form-error" id="join-group-error"></p>
+  </div>
+</div>
+
+<!-- Neuer Suchagent (Bottom Sheet) -->
+<div id="job-sheet" class="modal sheet" style="display:none">
+  <div class="modal-card sheet-card" role="dialog" aria-modal="true" aria-labelledby="job-sheet-title">
+    <div class="sheet-head">
+      <h3 id="job-sheet-title">Neuer Suchagent</h3>
+      <button class="icon-btn" data-close-sheet aria-label="Schließen"><span class="i" data-icon="x"></span></button>
+    </div>
+    <div class="field-group">
+      <label>Bezeichnung</label>
+      <input type="text" id="job-label" maxlength="100" placeholder="z.B. Berlin 2-Zimmer bis 1200€" />
+    </div>
+    <div class="field-group">
+      <label>Such-URL (Suchergebnisseite)</label>
+      <input type="url" id="job-url" maxlength="2000" placeholder="https://www.kleinanzeigen.de/s-wohnung-mieten/berlin/c203l3331" />
+    </div>
+    <details class="sheet-more">
+      <summary>So bekommst du eine Such-URL</summary>
+      <div class="hint-list">
+      <div class="hint-item"><strong>Kleinanzeigen</strong> – Suche filtern (Ort, Preis, Zimmer) → URL aus der Adressleiste kopieren.</div>
+      <div class="hint-item"><strong>ImmobilienScout24</strong> – Suchergebnisse filtern → URL kopieren.</div>
+      <div class="hint-item"><strong>Immowelt</strong> – Suchergebnisse filtern → URL kopieren.</div>
+      <div class="hint-item"><strong>rentola</strong> – Suchergebnisse filtern → URL kopieren.</div>
+      <div class="hint-item"><strong>meinestadt</strong> – Suchergebnisse filtern → URL kopieren.</div>
+      <div class="hint-item"><strong>LEG</strong> – auf leg-wohnen.de unter „Mietwohnungen“ die Region öffnen (z. B. …/mietwohnungen/bremen) → URL kopieren.</div>
+      <div class="hint-item"><strong>GEWOBA</strong> – die Wohnungssuche öffnen (gewoba.de/immobilien/mieten/wohnungssuche) → URL kopieren. Der Agent beobachtet alle aktuellen Angebote.</div>
+      <div class="hint-item"><strong>Vonovia</strong> – auf vonovia.de unter „Zuhause finden“ Ort und Filter einstellen → URL der Ergebnisseite kopieren.</div>
+      </div>
+    </details>
+    <details class="sheet-more">
+      <summary>Erweitert <span class="sheet-more-state" id="job-adv-state"></span></summary>
+    <div class="field-group" style="max-width:180px">
+      <label>Intervall (Minuten)</label>
+      <input type="number" id="job-interval" value="60" min="10" max="1440" />
+    </div>
+    <div class="field-group">
+      <label>Sichtbarkeit</label>
+      <select id="job-visibility">
+        <option value="global">Alle Nutzer sehen diese Inserate</option>
+        <option value="private">Nur ich (privat)</option>
+        <option value="group">Bestimmte Gruppe</option>
+      </select>
+    </div>
+    <div id="job-visibility-group-row" class="field-group" style="display:none">
+      <label>Gruppe</label>
+      <select id="job-visibility-group">
+        <option value="">Gruppe wählen…</option>
+      </select>
+    </div>
+    </details>
+    <button id="job-add-btn" class="btn-primary">
+      <span id="job-add-text">Suchagent hinzufügen</span>
+      <span id="job-add-spinner" style="display:none">⏳ …</span>
+    </button>
+    <p class="form-error" id="job-error"></p>
+  </div>
+</div>
+
+<!-- Inserat per Link (Bottom Sheet) -->
+<div id="add-sheet" class="modal sheet" style="display:none">
+  <div class="modal-card sheet-card" role="dialog" aria-modal="true" aria-labelledby="add-sheet-title">
+    <div class="sheet-head">
+      <h3 id="add-sheet-title">Inserat per Link</h3>
+      <button class="icon-btn" data-close-sheet aria-label="Schließen"><span class="i" data-icon="x"></span></button>
+    </div>
+    <div class="field-group">
+      <label>Inserat-Link</label>
+      <input type="url" id="listing-url" maxlength="2000" placeholder="https://www.kleinanzeigen.de/s-anzeige/..." />
+    </div>
+    <details class="sheet-more">
+      <summary>Unterstützte Portale</summary>
+    <div class="chip-row">
+      <span class="chip">kleinanzeigen.de</span>
+      <span class="chip">immobilienscout24.de</span>
+      <span class="chip">immowelt.de</span>
+      <span class="chip">rentola.de</span>
+      <span class="chip">meinestadt.de</span>
+      <span class="chip">vonovia.de</span>
+      <span class="chip">leg-wohnen.de</span>
+      <span class="chip">gewoba.de</span>
+    </div>
+    </details>
+    <details class="sheet-more">
+      <summary>Erweitert <span class="sheet-more-state" id="add-adv-state"></span></summary>
+    <div class="field-group">
+      <label>Sichtbarkeit</label>
+      <select id="add-visibility">
+        <option value="global">Alle Nutzer sehen dieses Inserat</option>
+        <option value="private">Nur ich (privat)</option>
+        <option value="group">Bestimmte Gruppe</option>
+      </select>
+    </div>
+    <div id="add-visibility-group-row" class="field-group" style="display:none">
+      <label>Gruppe</label>
+      <select id="add-visibility-group">
+        <option value="">Gruppe wählen…</option>
+      </select>
+    </div>
+    </details>
+    <button id="add-listing-btn" class="btn-primary">
+      <span id="add-btn-text">Laden &amp; hinzufügen</span>
+      <span id="add-btn-spinner" style="display:none">⏳ Lädt…</span>
+    </button>
+    <p class="form-error" id="add-error"></p>
   </div>
 </div>
 

@@ -1564,6 +1564,47 @@ document.addEventListener('keydown', e => {
 // ══════════════════════════════════════════════════════════
 //  ADD LISTING
 // ══════════════════════════════════════════════════════════
+// Bottom Sheets ("Neuer Suchagent", "Inserat per Link"): Buttons mit data-open-sheet öffnen sie.
+// Sie sind .modal und damit bei nav.js registriert – die Zurück-Geste schließt sie.
+const sheets = {
+  open(id) {
+    const el = $id(id);
+    el.querySelectorAll('.form-error').forEach(e => { e.textContent = ''; });
+    updateAdvancedState();
+    el.style.display = 'flex';
+    const first = el.querySelector('input:not([type=hidden])');
+    if (first && !matchMedia('(pointer:coarse)').matches) first.focus();   // mobil keine Tastatur sofort
+  },
+  close(id) { $id(id).style.display = 'none'; },
+};
+document.addEventListener('click', e => {
+  const opener = e.target.closest('[data-open-sheet]');
+  if (opener) return sheets.open(opener.dataset.openSheet);
+  const closer = e.target.closest('[data-close-sheet]');
+  if (closer) return sheets.close(closer.closest('.sheet').id);
+  if (e.target.classList && e.target.classList.contains('sheet')) sheets.close(e.target.id);   // Tipp auf den Hintergrund
+});
+document.addEventListener('keydown', e => {
+  if (e.key !== 'Escape') return;
+  const open = [...document.querySelectorAll('.sheet')].find(el => el.style.display === 'flex');
+  if (open) { e.preventDefault(); sheets.close(open.id); }
+});
+
+// "Erweitert"-Zeile zeigt die aktuelle Wahl, damit niemand übersieht, wer die Inserate sieht
+const VIS_SHORT = { global: 'alle Nutzer', private: 'nur ich', group: 'Gruppe' };
+function visLabel(sel, grpSel) {
+  if (sel.value !== 'group') return VIS_SHORT[sel.value] || sel.value;
+  const g = grpSel.selectedOptions[0];
+  return g && g.value ? `Gruppe „${g.textContent}“` : 'Gruppe';
+}
+function updateAdvancedState() {
+  const iv = parseInt($id('job-interval').value) || 60;
+  $id('job-adv-state').textContent = `· alle ${iv} Min. · sichtbar für ${visLabel($id('job-visibility'), $id('job-visibility-group'))}`;
+  $id('add-adv-state').textContent = `· sichtbar für ${visLabel($id('add-visibility'), $id('add-visibility-group'))}`;
+}
+['job-interval', 'job-visibility', 'job-visibility-group', 'add-visibility', 'add-visibility-group']
+  .forEach(id => $id(id).addEventListener('change', updateAdvancedState));
+
 $id('add-listing-btn').addEventListener('click', async () => {
   const url        = $id('listing-url').value.trim();
   const visibility  = $id('add-visibility').value;
@@ -1579,9 +1620,7 @@ $id('add-listing-btn').addEventListener('click', async () => {
   btnText.style.display = 'inline'; spinner.style.display = 'none'; btn.disabled = false;
   if (d.error) return setErr('add-error', d.error);
   $id('listing-url').value = '';
-  $id('preview-card').innerHTML = '';
-  $id('preview-card').appendChild(buildListCard(d.listing));
-  $id('add-preview').style.display = '';
+  sheets.close('add-sheet');
   toast('✅ Inserat hinzugefügt!');
   state.swipeQueue = [];
   loadMyAddedListings();
@@ -2194,6 +2233,7 @@ $id('job-add-btn').addEventListener('click', async () => {
   btnText.style.display='inline'; spinner.style.display='none'; btn.disabled=false;
   if (d.error) return setErr('job-error', d.error);
   $id('job-label').value = ''; $id('job-url').value = '';
+  sheets.close('job-sheet');
   toast('✅ Suchagent hinzugefügt – erster Lauf startet in Kürze');
   api(`/api/jobs/${d.job.id}/run`, { method:'POST' }).then(() => setTimeout(loadJobs, 4000));
   loadJobs();
