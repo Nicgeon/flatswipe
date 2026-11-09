@@ -83,6 +83,7 @@ async function startServer({ plan = {}, seed = false } = {}) {
   }
   return {
     base,
+    dbPath: path.join(dir, 'test.db'),
     log: () => log,
     stop: () => new Promise(res => { proc.once('exit', () => { fs.rmSync(dir, { recursive: true, force: true }); res(); }); proc.kill(); }),
   };

@@ -179,7 +179,7 @@ docker exec flatswipe node server/cli.js demote max
 ---
 
 #### `password <username|email> <new-password>`
-Reset a user's password directly. The new password must be at least 6 characters. The user's active sessions are not immediately invalidated, but they will need to log in again once the session expires.
+Reset a user's password directly. The new password must be at least 6 characters. All of the user's active sessions are logged out right away – handy if an account was taken over.
 
 ```bash
 docker exec flatswipe node server/cli.js password max newSecurePassword123
@@ -196,7 +196,7 @@ docker exec flatswipe node server/cli.js delete olduser
 ```
 
 #### `delete <username|email> --confirm`
-Permanently delete a user and all their associated data. This includes swipes, group memberships, push subscriptions, contacts, notification queue entries and contact notes. Search agents created by the user are kept but their owner reference is cleared.
+Permanently delete a user and all their associated data: swipes, group memberships and join requests, applicant profile, group templates, push subscriptions, contacts and notification queue entries. Search agents and listings the user added are kept, but their owner reference is cleared.
 
 ```bash
 docker exec flatswipe node server/cli.js delete olduser --confirm
@@ -218,8 +218,8 @@ docker exec flatswipe node server/cli.js help
 ### Notes
 
 - Commands accept both **username** and **email address** as identifier — whichever is more convenient.
-- The CLI reads and writes the SQLite database file directly (`/data/wohnungsswipe.db`). It works even if the server is down.
-- Because the CLI bypasses the running server's in-memory state, avoid running write commands (password, promote, demote, delete) while the server is under heavy load — the server saves the database periodically and could theoretically overwrite a concurrent CLI write. For safety, run CLI commands during low-traffic periods or after stopping the server with `docker compose stop`.
+- While the server is running, the CLI hands its commands to the server through a socket in the data directory (`/data/admin.sock`, only accessible to the container user). The server runs them on its live database, so changes apply immediately and are saved.
+- If the server is not running, the CLI reads and writes the SQLite database file (`/data/wohnungsswipe.db`) directly.
 - The `DB_PATH` environment variable is respected if you have a non-default database location configured.
 
 ---

@@ -2730,8 +2730,10 @@ app.use((err, req, res, next) => {
 initDb().then(() => {
   initVapid();
   startScheduler();
+  // Admin-CLI (server/cli.js) führt ihre Befehle hier auf der Datenbank im Speicher aus
+  require('./admin').serveAdminSocket(dbPath, { all: dbAll, get: dbGet, run: dbRun }, saveDb);
   app.listen(PORT, () => {
-    console.log(`🏠 WohnungsSwipe läuft auf Port ${PORT}`);
+    console.log(`🏠 Flatswipe läuft auf Port ${PORT}`);
     console.log(`   → http://localhost:${PORT}`);
   });
 }).catch(e => { console.error('DB init failed:', e); process.exit(1); });

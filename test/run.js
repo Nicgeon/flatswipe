@@ -27,6 +27,7 @@ const TESTS = [
   ['unit/dedupe.test.js'], ['unit/template.test.js'], ['unit/introduction.test.js'],
   ['unit/formatting.test.js'], ['unit/documents.test.js'],
   ['api/core.test.js', { seed: true }],
+  ['api/admin-cli.test.js', { seed: true }],
   ['api/duplicates.test.js', { plan: dupPlan }],
 ];
 if (withUi) for (const size of [['390', '844'], ['1440', '900']]) TESTS.push(
@@ -38,9 +39,10 @@ if (withUi) TESTS.push(['ui/tabs.test.js', { seed: true }], ['ui/shared-link.tes
 
 const FAILED = /^\s*✗|^\s*FAIL\b|\b[1-9]\d* (?:FAILS|failed)\b|fails: [1-9]|errors?: \[\s*"|^ERR\b|Error:/m;
 
-function runFile(file, base, args) {
+function runFile(file, server, args) {
   return new Promise(res => {
-    const p = spawn(process.execPath, [path.join(__dirname, file), shotDir, ...args], { env: { ...process.env, TEST_BASE: base || '' } });
+    const env = { ...process.env, TEST_BASE: (server && server.base) || '', TEST_DB: (server && server.dbPath) || '' };
+    const p = spawn(process.execPath, [path.join(__dirname, file), shotDir, ...args], { env });
     let out = '';
     p.stdout.on('data', d => { out += d; });
     p.stderr.on('data', d => { out += d; });
@@ -59,7 +61,7 @@ function runFile(file, base, args) {
     const label = `${file}${args.length ? ` (${args.join('×')})` : ''}`;
     const server = setup ? await startServer(setup) : null;
     const t0 = Date.now();
-    const { code, out } = await runFile(file, server && server.base, args);
+    const { code, out } = await runFile(file, server, args);
     if (server) await server.stop();
     const bad = code !== 0 || FAILED.test(out);
     const checks = (out.match(/^\s*✓/gm) || []).length;
