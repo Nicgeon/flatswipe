@@ -9,8 +9,9 @@ name: Container-Image
 #   1. "version" in package.json erhöhen und nach main mergen
 #   2. Auf GitHub unter "Releases" → "Draft a new release" einen neuen Tag
 #      vX.Y.Z auf main anlegen, "Generate release notes" klicken, veröffentlichen
-#   → das Image wird als :vX.Y.Z gebaut, und als :latest, wenn das Release keine
-#     Vorabversion ("pre-release") ist.
+#   → das Image wird als :vX.Y.Z gebaut, dazu
+#       :latest bei einem normalen Release,
+#       :beta   bei einer Vorabversion ("Set as a pre-release").
 #
 # Von Hand: Actions-Tab → "Container-Image" → "Run workflow" baut den gewählten
 # Branch mit der Version aus package.json als :vX.Y.Z und :latest.
@@ -51,6 +52,7 @@ jobs:
         run: |
           PKG=$(node -p "require('./package.json').version")
           LATEST=true
+          BETA=false
           if [ "$EVENT" = "release" ]; then
             if ! [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
               echo "::error::Release-Tag '$RELEASE_TAG' hat nicht das Format vX.Y.Z – es wird kein Image gebaut."
@@ -60,13 +62,14 @@ jobs:
             if [ "$V" != "$PKG" ]; then
               echo "::warning::Release $RELEASE_TAG, aber package.json enthält Version $PKG."
             fi
-            if [ "$PRERELEASE" = "true" ]; then LATEST=false; fi
+            if [ "$PRERELEASE" = "true" ]; then LATEST=false; BETA=true; fi
           else
             V="$PKG"
           fi
           echo "version=$V" >> "$GITHUB_OUTPUT"
           echo "latest=$LATEST" >> "$GITHUB_OUTPUT"
-          echo "::notice::Baue :v$V$([ "$LATEST" = true ] && echo ' und :latest')."
+          echo "beta=$BETA" >> "$GITHUB_OUTPUT"
+          echo "::notice::Baue :v$V$([ "$LATEST" = true ] && echo ' und :latest')$([ "$BETA" = true ] && echo ' und :beta')."
 
       - name: Anmelden bei ghcr.io
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
@@ -90,6 +93,7 @@ jobs:
           tags: |
             type=raw,value=v${{ steps.ver.outputs.version }}
             type=raw,value=latest,enable=${{ steps.ver.outputs.latest == 'true' }}
+            type=raw,value=beta,enable=${{ steps.ver.outputs.beta == 'true' }}
 
       - name: Build und Push
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2

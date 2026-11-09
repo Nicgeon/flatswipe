@@ -63,7 +63,7 @@ docker compose up -d
 That's it, Flatswipe now lives at <http://localhost:3000>. The first account you register automatically
 becomes admin – so be quick 😉 More admins: see [Admin CLI](#admin-cli).
 Images are built for `linux/amd64` and `linux/arm64` (hello, Raspberry Pi 👋): `:latest` is the newest
-release, `:vX.Y.Z` a fixed version.
+release, `:beta` the newest pre-release (for the brave 🧪), `:vX.Y.Z` a fixed version.
 
 No Docker? Node.js 22, then `npm ci && npm start`.
 
