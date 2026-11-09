@@ -17,7 +17,7 @@ Fristen kann ich nicht zusagen, Sicherheitsmeldungen haben aber Vorrang.
 ## Unterstützte Versionen
 
 Sicherheitskorrekturen gibt es nur für die **neueste veröffentlichte Version** (siehe Releases bzw.
-das Docker-Image `nicgeon/wohnungsswipe:latest`).
+das Container-Image `ghcr.io/nicgeon/flatswipe:latest`).
 
 ## Geltungsbereich
 

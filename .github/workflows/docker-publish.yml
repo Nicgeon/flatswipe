@@ -1,6 +1,7 @@
-name: Docker Hub
+name: Container-Image
 
-# Baut das Image und veröffentlicht es als nicgeon/wohnungsswipe auf Docker Hub –
+# Baut das Image und veröffentlicht es als ghcr.io/nicgeon/flatswipe in der
+# GitHub Container Registry (Packages) –
 # NUR bei einem Release (oder von Hand). Pushes und Merges lösen nichts aus,
 # damit keine Actions-Minuten verbraucht werden.
 #
@@ -11,9 +12,11 @@ name: Docker Hub
 #   → das Image wird als :vX.Y.Z gebaut, und als :latest, wenn das Release keine
 #     Vorabversion ("pre-release") ist.
 #
-# Von Hand: Actions-Tab → "Docker Hub" → "Run workflow" baut den gewählten Branch
-# mit der Version aus package.json als :vX.Y.Z und :latest.
-# Voraussetzung: Secrets DOCKERHUB_USERNAME und DOCKERHUB_TOKEN.
+# Von Hand: Actions-Tab → "Container-Image" → "Run workflow" baut den gewählten
+# Branch mit der Version aus package.json als :vX.Y.Z und :latest.
+# Keine Secrets nötig: angemeldet wird mit dem GITHUB_TOKEN des Workflows.
+# Beim ersten Veröffentlichen ist das Paket privat – unter Packages → flatswipe →
+# Package settings einmal auf "Public" stellen.
 # Die Actions sind auf Commit-Hashes festgelegt (Version als Kommentar), damit ein
 # verschobener Tag bei einem Anbieter keinen fremden Code in den Build bringt.
 
@@ -27,13 +30,14 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  IMAGE: nicgeon/wohnungsswipe
+  IMAGE: ghcr.io/nicgeon/flatswipe   # Kleinbuchstaben, sonst lehnt ghcr.io ab
 
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      packages: write
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -64,11 +68,12 @@ jobs:
           echo "latest=$LATEST" >> "$GITHUB_OUTPUT"
           echo "::notice::Baue :v$V$([ "$LATEST" = true ] && echo ' und :latest')."
 
-      - name: Docker Hub login
+      - name: Anmelden bei ghcr.io
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: QEMU (arm64 für Raspberry Pi / ARM-Server)
         uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
