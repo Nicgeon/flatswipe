@@ -802,7 +802,7 @@ function buildSwipeCard(listing) {
   card.innerHTML = `
     <div class="card-img-area" ${hasImg ? `style="${phStyle(images[0])}"` : ''}>
       ${hasImg
-        ? `<img class="card-image" src="${esc(images[0])}" onerror="this.style.display='none'" />`
+        ? `<img class="card-image" src="${esc(images[0])}" alt="" />`
         : `<div class="card-image-placeholder">${icon('image', 'lg')}</div>`}
       <span class="card-platform">${esc(platformBadge(listing))}</span>
       ${statusBadge}
@@ -928,7 +928,7 @@ function buildListCard(listing, opts = {}) {
       ${opts.selectable ? `<label class="rated-select-wrap rc-check" title="Inserat auswählen"><input type="checkbox" class="rated-select" data-listing-id="${listing.id}" ${state.ratedSelected.has(Number(listing.id)) ? 'checked' : ''}><span>${icon('check', 'sm')}</span></label>` : ''}
       <div class="list-card-img-area rc-ph"${hasImg ? ` style="${phStyle(images[0])}"` : ''}>
         ${hasImg
-          ? `<img class="list-card-img" src="${esc(images[0])}" loading="lazy" onerror="this.style.display='none'" />`
+          ? `<img class="list-card-img" src="${esc(images[0])}" loading="lazy" alt="" />`
           : `<div class="list-card-img-placeholder">${icon('image', 'lg')}</div>`}
         ${rate ? `<span class="rc-rate ${swipe}">${icon(rate[0], 'sm')}<span class="rc-rate-label">${rate[1]}</span></span>` : ''}
         ${listing.status === 'offline'  ? `<span class="rc-strip">Offline</span>` : ''}
@@ -1915,7 +1915,7 @@ async function openGroupDetail(group, opts = {}) {
       <div class="invite-row">
         <span style="font-size:.8rem;color:var(--text2)">Einladungscode:</span>
         <span class="invite-code-big">${esc(group.invite_code)}</span>
-        <button class="btn-ghost" style="padding:5px 10px;font-size:.76rem" onclick="navigator.clipboard?.writeText('${esc(group.invite_code)}').then(()=>window.__toast('📋 Kopiert!'))" aria-label="Code kopieren">${icon('copy', 'sm')}</button>
+        <button class="btn-ghost" style="padding:5px 10px;font-size:.76rem" data-copy="${esc(group.invite_code)}" aria-label="Code kopieren">${icon('copy', 'sm')}</button>
       </div>
     </div>
 
@@ -1956,7 +1956,6 @@ async function openGroupDetail(group, opts = {}) {
   };
   $id('gd-tabs').querySelectorAll('.gd-tab').forEach(b => b.addEventListener('click', () => showGroupTab(b.dataset.gdTab)));
   if (opts.tab === 'profile') showGroupTab('profile');
-  window.__toast = toast;
 
   // Accept / decline join requests
   $id('group-detail-content').querySelectorAll('[data-request-action]').forEach(btn => {
@@ -2602,6 +2601,17 @@ async function openSharedListingFromUrl() {
 }
 
 // Applicant profile page, message generator and group profile tab live in profile.js
+
+// Kein Inline-JavaScript (Content-Security-Policy): Bild-Fehler und Kopier-Knöpfe laufen über
+// zentrale Listener statt über onerror="…"/onclick="…" im HTML.
+document.addEventListener('error', e => {
+  const t = e.target;
+  if (t.tagName === 'IMG' && (t.classList.contains('card-image') || t.classList.contains('list-card-img'))) t.style.display = 'none';
+}, true);
+document.addEventListener('click', e => {
+  const b = e.target.closest('[data-copy]');
+  if (b) navigator.clipboard?.writeText(b.dataset.copy).then(() => toast('📋 Kopiert!'));
+});
 
 // ══════════════════════════════════════════════════════════
 //  OVERLAYS → phone back button

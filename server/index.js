@@ -574,10 +574,32 @@ if (IS_HTTPS) {
   app.set('trust proxy', 1);
 }
 
-// Security headers (CSP intentionally left off: the app relies throughout
-// on an early inline <head> script for the no-flash theme switch, and on
-// inline style="" attributes, which a default CSP would block outright).
-app.use(helmet({ contentSecurityPolicy: false }));
+// Security headers incl. Content-Security-Policy. Scripts only from our own files – no inline
+// scripts or onclick="…" anywhere, so injected markup can't run code. Inline styles stay
+// allowed (many style="" attributes; far less dangerous than scripts). Listing photos come
+// from the portals (any https host); the map in the detail view is an OpenStreetMap iframe.
+app.use(helmet({
+  contentSecurityPolicy: {
+    useDefaults: false,
+    directives: {
+      defaultSrc:     ["'self'"],
+      scriptSrc:      ["'self'"],
+      scriptSrcAttr:  ["'none'"],
+      styleSrc:       ["'self'", "'unsafe-inline'"],
+      imgSrc:         ["'self'", 'https:', 'data:', 'blob:', ...(IS_HTTPS ? [] : ['http:'])],   // http: nur ohne HTTPS (lokal)
+      fontSrc:        ["'self'"],
+      connectSrc:     ["'self'"],
+      frameSrc:       ['https://www.openstreetmap.org'],
+      workerSrc:      ["'self'"],
+      manifestSrc:    ["'self'"],
+      objectSrc:      ["'none'"],
+      baseUri:        ["'self'"],
+      formAction:     ["'self'"],
+      frameAncestors: ["'none'"],
+      ...(IS_HTTPS ? { upgradeInsecureRequests: [] } : {}),
+    },
+  },
+}));
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -2710,33 +2732,14 @@ app.get('/reset-password', (req, res) => {
     .msg{font-size:.85rem;margin-top:12px;min-height:1.2em}
     .ok{color:#5bdc8a}.err{color:#f05060}
   </style></head><body>
-  <div class="box">
+  <form class="box" id="reset-form">
     <h2>🏠 Neues Passwort</h2>
-    <input type="password" id="pw1" placeholder="Neues Passwort" />
-    <input type="password" id="pw2" placeholder="Passwort wiederholen" />
-    <button onclick="submit()">Passwort setzen</button>
-    <div class="msg" id="msg"></div>
-  </div>
-  <script>
-    const token = new URLSearchParams(location.search).get('token');
-    async function submit() {
-      const pw1 = document.getElementById('pw1').value;
-      const pw2 = document.getElementById('pw2').value;
-      const msg = document.getElementById('msg');
-      if (!pw1 || pw1.length < 6) { msg.className='msg err'; msg.textContent='Mindestens 6 Zeichen'; return; }
-      if (pw1 !== pw2)             { msg.className='msg err'; msg.textContent='Passwörter stimmen nicht überein'; return; }
-      const r = await fetch('/api/auth/reset-password', {
-        method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({ token, password: pw1 })
-      }).then(r=>r.json());
-      if (r.success) {
-        msg.className='msg ok'; msg.textContent='✓ Passwort geändert – du kannst dich jetzt einloggen.';
-        setTimeout(()=>location.href='/', 2000);
-      } else {
-        msg.className='msg err'; msg.textContent=r.error||'Fehler';
-      }
-    }
-  </script>
+    <input type="password" id="pw1" placeholder="Neues Passwort" maxlength="200" autocomplete="new-password" />
+    <input type="password" id="pw2" placeholder="Passwort wiederholen" maxlength="200" autocomplete="new-password" />
+    <button type="submit">Passwort setzen</button>
+    <div class="msg" id="msg" role="status"></div>
+  </form>
+  <script src="/js/reset-password.js"></script>
   </body></html>`);
 });
 

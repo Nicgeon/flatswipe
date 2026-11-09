@@ -1,12 +1,13 @@
 const BASE = process.env.TEST_BASE;            // set by test/run.js
 const SC=process.argv[2]; const { chromium, launchOptions } = require('../helpers/browser');
+const { watchCsp, cspViolations } = require('../helpers/csp');
 const B=BASE;
 (async()=>{
   const b=await chromium.launch(launchOptions);
   const errs=[]; let fails=0; const ok=(c,m)=>{console.log((c?'✓ ':'✗ ')+m); if(!c)fails++;};
   for (const [label,w,h] of [['d',1440,900],['m',390,844]]) for (const th of ['dark','light']) {
     const desk = w>=900;
-    const ctx=await b.newContext({viewport:{width:w,height:h},hasTouch:!desk});
+    const ctx=await b.newContext({viewport:{width:w,height:h},hasTouch:!desk}); await watchCsp(ctx);
     const page=await ctx.newPage(); page.on('pageerror',e=>errs.push(label+': '+e.message)); page.on('console',m=>{if(m.type()==='error'&&!/Failed to load resource|fonts.g/.test(m.text()))errs.push(m.text())});
     await page.goto(B);
     await page.evaluate(async(th)=>{localStorage.setItem('ws-theme',th);await fetch('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:'anna@x.de',password:'secret123'})})},th);
@@ -55,6 +56,7 @@ const B=BASE;
     }
     await page.click('#logout-btn'); await page.waitForTimeout(600);
     ok(await vis('#login-form')||await vis('.auth-tabs'),`${L}: logout on Profil page`);
+    { const v = await cspViolations(page); ok(!v.length, 'no CSP violations ' + JSON.stringify(v)); }
     await ctx.close();
   }
   console.log('errors:',errs.length?errs:'none'); console.log('fails:',fails); await b.close();

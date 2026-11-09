@@ -2,11 +2,12 @@
 // Leerer Swipe-Stapel: Knöpfe führen direkt zum passenden Formular. Gruppen-Detail: Kopfzeile mit Zurück.
 const B = process.env.TEST_BASE;
 const SC = process.argv[2]; const { chromium, launchOptions } = require('../helpers/browser');
+const { watchCsp, cspViolations } = require('../helpers/csp');
 (async () => {
   const b = await chromium.launch(launchOptions);
   const errs = []; let fails = 0; const ok = (c, m) => { console.log((c ? '✓ ' : '✗ ') + m); if (!c) fails++; };
   for (const [L, w, h] of [['d', 1440, 900], ['m', 390, 844]]) {
-    const ctx = await b.newContext({ viewport: { width: w, height: h }, hasTouch: w < 900 });
+    const ctx = await b.newContext({ viewport: { width: w, height: h }, hasTouch: w < 900 }); await watchCsp(ctx);
     const page = await ctx.newPage(); page.on('pageerror', e => errs.push(L + ': ' + e.message));
     const api = (method, p, body) => page.evaluate(([m, p, body]) => fetch(p, { method: m, headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined }).then(r => r.json()), [method, p, body]);
     await page.goto(B);
@@ -55,6 +56,7 @@ const SC = process.argv[2]; const { chromium, launchOptions } = require('../help
     await page.screenshot({ path: `${SC}/detail-actions-${L}.png` });
     // undo for the next size
     for (const id of ids) await api('DELETE', `/api/listings/swipe/${id}`);
+    { const v = await cspViolations(page); ok(!v.length, 'no CSP violations ' + JSON.stringify(v)); }
     await ctx.close();
   }
   await b.close();

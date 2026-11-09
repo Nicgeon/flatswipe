@@ -2,12 +2,13 @@
 // Zurück-Geste, Escape und Tipp auf den Hintergrund schließen das Sheet; "Erweitert" zeigt die Wahl.
 const B = process.env.TEST_BASE;
 const SC = process.argv[2]; const { chromium, launchOptions } = require('../helpers/browser');
+const { watchCsp, cspViolations } = require('../helpers/csp');
 (async () => {
   const b = await chromium.launch(launchOptions);
   const errs = []; let fails = 0; const ok = (c, m) => { console.log((c ? '✓ ' : '✗ ') + m); if (!c) fails++; };
   for (const [L, w, h] of [['d', 1440, 900], ['m', 390, 844]]) {
     const desk = w >= 900;
-    const ctx = await b.newContext({ viewport: { width: w, height: h }, hasTouch: !desk });
+    const ctx = await b.newContext({ viewport: { width: w, height: h }, hasTouch: !desk }); await watchCsp(ctx);
     const page = await ctx.newPage(); page.on('pageerror', e => errs.push(L + ': ' + e.message));
     await page.goto(B);
     await page.evaluate(() => fetch('/api/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: 'anna@x.de', password: 'secret123' }) }));
@@ -62,6 +63,7 @@ const SC = process.argv[2]; const { chromium, launchOptions } = require('../help
     await page.click('#view-add .page-head [data-open-sheet]'); await page.waitForTimeout(150);
     ok(await page.textContent('#add-error') === '', `${L}: reopening starts without the old error`);
     await page.screenshot({ path: `${SC}/search-sheet-${L}.png` });
+    { const v = await cspViolations(page); ok(!v.length, 'no CSP violations ' + JSON.stringify(v)); }
     await ctx.close();
   }
   await b.close();
