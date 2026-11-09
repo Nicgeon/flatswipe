@@ -60,7 +60,7 @@ function initVapid() {
       fs.writeFileSync(vapidFile, JSON.stringify(keys));
     }
     webpush.setVapidDetails(
-      process.env.VAPID_SUBJECT || 'mailto:admin@wohnungsswipe.local',
+      process.env.VAPID_SUBJECT || 'mailto:admin@flatswipe.local',
       VAPID_PUBLIC,
       VAPID_PRIVATE
     );
@@ -2507,7 +2507,7 @@ async function sendNtfy(user, title, body, view = '') {
     console.warn(`[ntfy] Server-Adresse für Nutzer ${user.id} abgelehnt (ungültig oder intern): ${server}`);
     return;
   }
-  const safeTitle = stripEmojis(title) || 'WohnungsSwipe';
+  const safeTitle = stripEmojis(title) || 'Flatswipe';
   const safeBody  = stripEmojis(body)  || stripEmojis(title) || '';
   const tags      = extractNtfyTags(title + ' ' + body);
 
@@ -2685,7 +2685,7 @@ app.get('/api/notify/unsubscribe-email', (req, res) => {
   const { token } = req.query;
   if (!token) {
     return res.send(`<!DOCTYPE html><html lang="de"><head><meta charset="UTF-8">
-    <title>Abmelden – WohnungsSwipe</title>
+    <title>Abmelden – Flatswipe</title>
     <style>body{font-family:sans-serif;background:#0f0f11;color:#f0ede8;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
     .box{background:#18181c;border:1px solid rgba(255,255,255,.08);border-radius:16px;padding:32px;max-width:380px;text-align:center}
     h2{color:#f05060;margin-bottom:12px}p{color:#9b9896;font-size:.9rem}</style>
@@ -2695,7 +2695,7 @@ app.get('/api/notify/unsubscribe-email', (req, res) => {
   const user = dbGet('SELECT * FROM users WHERE unsubscribe_token=?', [token]);
   if (!user) {
     return res.send(`<!DOCTYPE html><html lang="de"><head><meta charset="UTF-8">
-    <title>Abmelden – WohnungsSwipe</title>
+    <title>Abmelden – Flatswipe</title>
     <style>body{font-family:sans-serif;background:#0f0f11;color:#f0ede8;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
     .box{background:#18181c;border:1px solid rgba(255,255,255,.08);border-radius:16px;padding:32px;max-width:380px;text-align:center}
     h2{color:#f05060;margin-bottom:12px}p{color:#9b9896;font-size:.9rem}</style>
@@ -2706,14 +2706,14 @@ app.get('/api/notify/unsubscribe-email', (req, res) => {
   saveDb();
 
   res.send(`<!DOCTYPE html><html lang="de"><head><meta charset="UTF-8">
-  <title>Abgemeldet – WohnungsSwipe</title>
+  <title>Abgemeldet – Flatswipe</title>
   <style>body{font-family:sans-serif;background:#0f0f11;color:#f0ede8;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
   .box{background:#18181c;border:1px solid rgba(255,255,255,.08);border-radius:16px;padding:32px;max-width:380px;text-align:center}
   h2{color:#5bdc8a;margin-bottom:12px}p{color:#9b9896;font-size:.9rem;line-height:1.6}
   a{color:#e8c97a}</style>
   </head><body><div class="box">
   <h2>✓ Abgemeldet</h2>
-  <p>Du erhältst keine E-Mail-Benachrichtigungen mehr von WohnungsSwipe.</p>
+  <p>Du erhältst keine E-Mail-Benachrichtigungen mehr von Flatswipe.</p>
   <p style="margin-top:16px"><a href="${process.env.BASE_URL || 'http://localhost:3000'}">Zurück zur App →</a></p>
   </div></body></html>`);
 });
@@ -2721,7 +2721,7 @@ app.get('/api/notify/unsubscribe-email', (req, res) => {
 // ── Password reset page ────────────────────────────────────
 app.get('/reset-password', (req, res) => {
   res.send(`<!DOCTYPE html><html lang="de"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Passwort zurücksetzen – WohnungsSwipe</title>
+  <title>Passwort zurücksetzen – Flatswipe</title>
   <style>
     body{font-family:sans-serif;background:#0f0f11;color:#f0ede8;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
     .box{background:#18181c;border:1px solid rgba(255,255,255,.08);border-radius:16px;padding:32px;width:100%;max-width:380px}

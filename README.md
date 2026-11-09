@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="public/brand/logo-dark.png">
-    <img src="public/brand/logo-light.png" alt="Flatswipe" width="420">
+    <img src="public/brand/logo-light.png" alt="Flatswipe" width="350">
   </picture>
 </p>
 

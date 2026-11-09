@@ -20,7 +20,7 @@ services:
       #   SMTP_PORT=587
       #   SMTP_USER=deine@gmail.com
       #   SMTP_PASS=dein-app-passwort
-      #   SMTP_FROM="WohnungsSwipe" <deine@gmail.com>
+      #   SMTP_FROM="Flatswipe" <deine@gmail.com>
       - SMTP_HOST=
       - SMTP_PORT=587
       - SMTP_USER=

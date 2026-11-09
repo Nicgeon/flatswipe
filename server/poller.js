@@ -1,5 +1,5 @@
 /**
- * poller.js – Suche-Scraper für WohnungsSwipe
+ * poller.js – Suche-Scraper für Flatswipe
  *
  * Ablauf pro Job:
  *  1. Suchergebnisseite abrufen (Vonovia/GEWOBA: über deren JSON-Daten, LEG: Regionsseite)
@@ -732,7 +732,7 @@ async function geocodeLocation(locationText) {
   try {
     const res = await fetch(
       `https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(locationText.trim())}`,
-      { headers: { 'User-Agent': 'WohnungsSwipe/1.0 (self-hosted apartment search tool)' }, timeout: 8000 }
+      { headers: { 'User-Agent': 'Flatswipe/1.0 (self-hosted apartment search tool)' }, timeout: 8000 }
     );
     if (!res.ok) return null;
     const results = await res.json();

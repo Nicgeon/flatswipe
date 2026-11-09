@@ -1,6 +1,6 @@
 self.addEventListener('push', e => {
   const data = e.data?.json() || {};
-  e.waitUntil(self.registration.showNotification(data.title || 'WohnungsSwipe', {
+  e.waitUntil(self.registration.showNotification(data.title || 'Flatswipe', {
     body:    data.body  || '',
     icon:    data.icon  || '/brand/icon-192.png',
     badge:   '/brand/icon-192.png',
