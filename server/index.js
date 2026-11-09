@@ -1099,8 +1099,8 @@ app.post('/api/groups/:id/remind-profile/:userId', requireAuth, async (req, res)
 
   const title = `${sender?.username || 'Jemand'} bittet dich um dein Bewerber-Profil`;
   const body  = `Gruppe: ${group.name} – damit eure gemeinsamen Anfragen vollständig sind.`;
-  if (shouldNotify(targetUser, 'nudge', 'push'))  await sendPushToUser(target, { title, body, url: '/?view=settings', icon: '/icon-192.png' });
-  if (shouldNotify(targetUser, 'nudge', 'ntfy'))  await sendNtfy(targetUser, title, body, 'settings');
+  if (shouldNotify(targetUser, 'nudge', 'push'))  await sendPushToUser(target, { title, body, url: '/?view=profile', icon: '/icon-192.png' });
+  if (shouldNotify(targetUser, 'nudge', 'ntfy'))  await sendNtfy(targetUser, title, body, 'profile');
   if (shouldNotify(targetUser, 'nudge', 'email')) {
     await mailer.sendProfileReminderMail(targetUser.email, targetUser.username, sender?.username || 'Jemand', group.name, targetUser.unsubscribe_token || '');
   }

@@ -100,7 +100,7 @@ function showScreen(id) {
 
 // Which bottom-bar / header tab a page belongs to
 const TAB_OF = { swipe:'swipe', rated:'rated', groups:'groups', jobs:'search', add:'search', archive:'search',
-                 me:'me', profile:'me', settings:'me' };
+                 me:'me', profile:'me', account:'me', notify:'me', admin:'me' };
 const SEARCH_VIEWS = ['jobs', 'add', 'archive'];
 const SEARCH_LABELS = { jobs: 'Agenten', add: 'Hinzufügen', archive: 'Archiv' };
 
@@ -133,7 +133,9 @@ function renderView(name) {
   if (name === 'rated')    loadRated();
   if (name === 'groups')   loadGroups();
   if (name === 'jobs')     loadJobs();
-  if (name === 'settings') loadSettings();
+  if (name === 'account' || name === 'notify') loadSettings();
+  if (name === 'admin')    loadAdminUsers();
+  if (name === 'me')       loadMeStatus();
   if (name === 'profile')  window.loadProfilePage?.();
   if (name === 'archive')  loadArchive();
   if (name === 'add')      loadMyAddedListings();
@@ -2300,19 +2302,27 @@ async function loadSettings() {
     btn.classList.toggle('active', btn.dataset.interval === interval);
   });
 
-  // Stats
-  const s = await api('/api/auth/stats');
+  // Push button state
+  await updatePushButtonState();
+}
+
+// Profil-Seite: Statistiken und der aktuelle Stand in den Zeilen ("Push an · E-Mail aus")
+async function loadMeStatus() {
+  const [me, s] = await Promise.all([api('/api/auth/me'), api('/api/auth/stats')]);
+  if (!me.loggedIn) return;
   $id('stat-likes').textContent      = s.likes      ?? '—';
   $id('stat-superlikes').textContent = s.superlikes ?? '—';
   $id('stat-dislikes').textContent   = s.dislikes   ?? '—';
   $id('stat-groups').textContent     = s.groups     ?? '—';
-
-  // Push button state
-  await updatePushButtonState();
-
-  // Admin section
-  const adminSection = $id('admin-section');
-  if (adminSection) adminSection.style.display = me.is_admin ? '' : 'none';
+  $id('mh-admin-row').hidden = !me.is_admin;
+  const push = await pushSubscribed();
+  const on = [push && 'Push', me.ntfy_topic && 'ntfy', me.notify_email && 'E-Mail'].filter(Boolean);
+  $id('mh-notify-sub').textContent = on.length ? `An: ${on.join(', ')}` : 'Alle Kanäle aus';
+}
+async function pushSubscribed() {
+  if (!('serviceWorker' in navigator)) return false;
+  const reg = await navigator.serviceWorker.getRegistration().catch(() => null);
+  return !!(reg && await reg.pushManager.getSubscription().catch(() => null));
 }
 
 $id('save-username-btn').addEventListener('click', async () => {
@@ -2516,10 +2526,7 @@ $id('archive-filter')?.addEventListener('click', e => {
 // ══════════════════════════════════════════════════════════
 //  ADMIN
 // ══════════════════════════════════════════════════════════
-$id('admin-users-btn')?.addEventListener('click', async () => {
-  const panel = $id('admin-users-panel');
-  if (panel.style.display !== 'none') { panel.style.display = 'none'; return; }
-  panel.style.display = '';
+async function loadAdminUsers() {
   const { users = [] } = await api('/api/admin/users');
   const list = $id('admin-users-list');
   list.innerHTML = '';
@@ -2540,18 +2547,18 @@ $id('admin-users-btn')?.addEventListener('click', async () => {
 
     row.querySelector('[data-promote]')?.addEventListener('click', async () => {
       const r = await api('/api/admin/promote', { method: 'POST', body: { targetUserId: u.id } });
-      if (r.success) { toast('✓ ' + r.message); $id('admin-users-btn').click(); $id('admin-users-btn').click(); }
+      if (r.success) { toast('✓ ' + r.message); loadAdminUsers(); }
       else toast('❌ ' + (r.error || 'Fehler'));
     });
     row.querySelector('[data-demote]')?.addEventListener('click', async () => {
       const r = await api('/api/admin/demote', { method: 'POST', body: { targetUserId: u.id } });
-      if (r.success) { toast('✓ Admin-Rechte entfernt'); $id('admin-users-btn').click(); $id('admin-users-btn').click(); }
+      if (r.success) { toast('✓ Admin-Rechte entfernt'); loadAdminUsers(); }
       else toast('❌ ' + (r.error || 'Fehler'));
     });
 
     list.appendChild(row);
   });
-});
+}
 
 // Opens the detail view for a listing referenced by a shared link
 // (?listing=<id> in the URL), then cleans the URL so a refresh doesn't

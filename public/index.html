@@ -241,6 +241,12 @@
         <span class="me-avatar" id="me-avatar">?</span>
         <span class="me-who"><span class="me-name" id="me-name"></span><span class="me-mail" id="me-email"></span></span>
       </div>
+      <div class="me-stats" aria-label="Statistiken">
+        <div><b id="stat-likes">—</b><span>Likes</span></div>
+        <div><b id="stat-superlikes">—</b><span>Super</span></div>
+        <div><b id="stat-dislikes">—</b><span>Nein</span></div>
+        <div><b id="stat-groups">—</b><span>Gruppen</span></div>
+      </div>
 
       <div class="mh-list">
         <button class="mh-row" data-goto="profile">
@@ -249,9 +255,19 @@
             <span class="mh-bar" id="mh-profile-bar" hidden><i></i></span></span>
           <span class="mh-chev i sm" data-icon="next"></span>
         </button>
-        <button class="mh-row" data-goto="settings">
-          <span class="mh-tile i" data-icon="sliders"></span>
-          <span class="mh-text"><b>Konto &amp; Einstellungen</b><span>Benachrichtigungen, Statistiken, Passwort</span></span>
+        <button class="mh-row" data-goto="notify">
+          <span class="mh-tile i" data-icon="bell"></span>
+          <span class="mh-text"><b>Benachrichtigungen</b><span id="mh-notify-sub">Push, ntfy, E-Mail</span></span>
+          <span class="mh-chev i sm" data-icon="next"></span>
+        </button>
+        <button class="mh-row" data-goto="account">
+          <span class="mh-tile i" data-icon="lock"></span>
+          <span class="mh-text"><b>Konto &amp; Sicherheit</b><span>Name, E-Mail, Passwort</span></span>
+          <span class="mh-chev i sm" data-icon="next"></span>
+        </button>
+        <button class="mh-row" data-goto="admin" id="mh-admin-row" hidden>
+          <span class="mh-tile i" data-icon="shield"></span>
+          <span class="mh-text"><b>Nutzerverwaltung</b><span id="mh-admin-sub">Admin-Rechte vergeben</span></span>
           <span class="mh-chev i sm" data-icon="next"></span>
         </button>
       </div>
@@ -367,12 +383,17 @@
   </div>
 
   <!-- ── SETTINGS ──────────────────────────────────── -->
-  <div id="view-settings" class="view">
-    <div class="view-content">
-      <button class="btn-ghost back-btn" data-back><span class="i sm" data-icon="back"></span>Zurück</button>
-      <h2 class="view-title">Konto &amp; Einstellungen</h2>
+  <!-- ── KONTO & SICHERHEIT ────────────────────────── -->
+  <div id="view-account" class="view">
+    <div class="view-content me-page">
+      <div class="sub-head">
+        <button class="sub-back" type="button" data-back aria-label="Zurück"><span class="i" data-icon="back"></span></button>
+        <div class="sub-head-text">
+          <div class="sub-crumb">Profil</div>
+          <h2 class="view-title">Konto &amp; Sicherheit</h2>
+        </div>
+      </div>
 
-      <!-- Account card -->
       <div class="settings-card">
         <div class="settings-avatar-row">
           <div class="settings-avatar" id="settings-avatar">?</div>
@@ -381,21 +402,6 @@
             <div class="settings-display-email" id="settings-display-email">—</div>
             <div class="settings-display-since" id="settings-display-since"></div>
           </div>
-        </div>
-      </div>
-
-      <!-- ══ Kategorie: Konto ══ -->
-      <details class="settings-cat">
-        <summary><span class="i " data-icon="user"></span>Konto &amp; Statistiken</summary>
-
-      <!-- Stats -->
-      <div class="settings-section">
-        <div class="section-label">Statistiken</div>
-        <div class="stats-grid">
-          <div class="stat-chip"><span class="stat-num" id="stat-likes">—</span><span class="stat-label">Likes</span></div>
-          <div class="stat-chip"><span class="stat-num" id="stat-superlikes">—</span><span class="stat-label">Super-Likes</span></div>
-          <div class="stat-chip"><span class="stat-num" id="stat-dislikes">—</span><span class="stat-label">Übersprungen</span></div>
-          <div class="stat-chip"><span class="stat-num" id="stat-groups">—</span><span class="stat-label">Gruppen</span></div>
         </div>
       </div>
 
@@ -449,15 +455,22 @@
         <p class="form-success" id="settings-pw-ok"></p>
       </div>
 
-      <!-- Notifications -->
-      </details>
+    </div>
+  </div>
 
-      <!-- ══ Kategorie: Benachrichtigungen ══ -->
-      <details class="settings-cat">
-        <summary><span class="i " data-icon="bell"></span>Benachrichtigungen</summary>
+  <!-- ── BENACHRICHTIGUNGEN ─────────────────────────── -->
+  <div id="view-notify" class="view">
+    <div class="view-content me-page">
+      <div class="sub-head">
+        <button class="sub-back" type="button" data-back aria-label="Zurück"><span class="i" data-icon="back"></span></button>
+        <div class="sub-head-text">
+          <div class="sub-crumb">Profil</div>
+          <h2 class="view-title">Benachrichtigungen</h2>
+        </div>
+      </div>
 
       <div class="settings-section">
-        <div class="section-label">Benachrichtigungen – Kanäle</div>
+        <div class="section-label">Kanäle</div>
 
         <!-- Browser Push -->
         <div class="notify-row">
@@ -505,7 +518,7 @@
       </div>
 
       <div class="settings-section">
-        <div class="section-label">Benachrichtigungen – wer bekommt was?</div>
+        <div class="section-label">Wer bekommt was?</div>
         <p class="notify-sub" style="margin-bottom:12px">Wähle pro Ereignis, über welche Kanäle du informiert werden möchtest.</p>
         <div class="notify-matrix" id="notify-matrix">
           <div class="notify-matrix-header">
@@ -546,7 +559,7 @@
       </div>
 
       <div class="settings-section">
-        <div class="section-label">Sammelbenachrichtigung für „Neue Inserate"</div>
+        <div class="section-label">Sammelmeldung für „Neue Inserate“</div>
 
         <!-- Digest interval -->
         <div class="digest-row" id="digest-row">
@@ -572,19 +585,24 @@
         <p class="form-success" id="notify-ok"></p>
       </div>
 
-      </details>
+    </div>
+  </div>
 
-      <!-- Admin section (only visible for admins) -->
-      <div class="settings-section" id="admin-section" style="display:none">
-        <div class="section-label">Administration</div>
-        <p style="font-size:var(--fs-small);color:var(--text2);margin-bottom:10px">Du bist Administrator. Du siehst alle Suchagenten und kannst Nutzerrechte verwalten.</p>
-        <button class="btn-secondary" id="admin-users-btn" style="width:100%;margin-bottom:8px"><span class="i sm" data-icon="users"></span>Nutzerverwaltung</button>
-        <div id="admin-users-panel" style="display:none">
-          <div id="admin-users-list"></div>
+  <!-- ── NUTZERVERWALTUNG (nur Admins) ──────────────── -->
+  <div id="view-admin" class="view">
+    <div class="view-content me-page">
+      <div class="sub-head">
+        <button class="sub-back" type="button" data-back aria-label="Zurück"><span class="i" data-icon="back"></span></button>
+        <div class="sub-head-text">
+          <div class="sub-crumb">Profil</div>
+          <h2 class="view-title">Nutzerverwaltung</h2>
         </div>
-        <p class="form-success" id="admin-ok"></p>
       </div>
 
+      <div class="settings-section" id="admin-section">
+        <p class="notify-sub">Als Admin siehst du alle Suchagenten und kannst anderen Nutzern Admin-Rechte geben. Passwörter setzen und Nutzer löschen geht über die Admin-CLI.</p>
+        <div id="admin-users-list"></div>
+      </div>
     </div>
   </div>
 </div><!-- end app-screen -->

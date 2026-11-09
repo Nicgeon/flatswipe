@@ -1016,27 +1016,6 @@ button:focus-visible, a:focus-visible, summary:focus-visible { outline:2px solid
 }
 .detail-msg-btn:hover { background:rgba(91,220,138,.15); }
 
-/* ── Settings categories (collapsible) ─────────────────── */
-.settings-cat {
-  background:var(--bg2); border:1px solid var(--border); border-radius:14px;
-  margin-bottom:12px; overflow:hidden;
-}
-.settings-cat > summary {
-  padding:16px 18px; font-family:'Fraunces',serif; font-size:1.05rem; font-weight:600;
-  cursor:pointer; list-style:none; display:flex; align-items:center; gap:12px;
-  user-select:none;
-}
-.settings-cat > summary > .i { color:var(--accent-text); }
-.settings-cat > summary::-webkit-details-marker { display:none; }
-.settings-cat > summary::after {
-  content:''; margin:0 4px 0 auto; width:8px; height:8px; border:solid var(--text2); border-width:0 2px 2px 0;
-  transform:rotate(-45deg); transition:transform .2s; flex:none;
-}
-.settings-cat[open] > summary::after { transform:rotate(45deg); }
-.settings-cat > summary:hover { background:var(--bg3); }
-.settings-cat .settings-section { border:none; background:transparent; padding:0 18px 18px; margin:0; }
-.settings-cat .settings-section + .settings-section { border-top:1px solid var(--border); padding-top:16px; }
-
 /* ── Message preview box ───────────────────────────────── */
 
 
@@ -1477,3 +1456,18 @@ body.rated-selecting #view-rated .view-content { padding-bottom:150px; }
   .sheet-card::before { display:none; }
 }
 .sheet-card .form-error:empty { display:none; }
+
+/* ── Unterseiten im Profil: Kopfzeile mit Zurück, Brotkrumen und Titel ── */
+.sub-head { display:flex;align-items:center;gap:12px;margin-bottom:16px; }
+.sub-back { width:44px;height:44px;flex:none;border-radius:12px;border:1px solid var(--border);background:var(--bg2);color:var(--text);cursor:pointer;display:inline-flex;align-items:center;justify-content:center; }
+.sub-back:hover { border-color:var(--border-hover); }
+.sub-head-text { flex:1;min-width:0; }
+.sub-crumb { font-size:var(--fs-small);color:var(--text2); }
+.sub-head .view-title { margin:0; }
+
+/* ── Statistiken auf der Profil-Seite ── */
+.me-stats { display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:0 0 16px; }
+.me-stats > div { background:var(--bg2);border:1px solid var(--border);border-radius:14px;padding:10px 6px;display:flex;flex-direction:column;align-items:center;gap:2px; }
+.me-stats b { font-family:'Fraunces',serif;font-size:1.2rem; }
+.me-stats span { font-size:var(--fs-tiny);color:var(--text2); }
+.mh-row[hidden] { display:none; }

@@ -13,7 +13,7 @@
  *     (sonst müsste man nach zehn Tab-Wechseln zehnmal zurück).
  *
  * Aufbau: Jeder History-Eintrag trägt den "Pfad" der Seiten
- * (z. B. ['swipe','me','settings']) und die Zahl der offenen Overlays.
+ * (z. B. ['swipe','me','notify']) und die Zahl der offenen Overlays.
  * Eigene history.go()-Aufrufe laufen über eine Warteschlange, damit auf
  * ein Zurück gewartet wird, bevor der nächste Eintrag gesetzt wird.
  */
@@ -29,13 +29,17 @@
     archive:  '#/suche/archiv',
     me:       '#/profil',
     profile:  '#/profil/bewerber',
-    settings: '#/profil/einstellungen',
+    account:  '#/profil/konto',
+    notify:   '#/profil/benachrichtigungen',
+    admin:    '#/profil/verwaltung',
   };
   const BY_ROUTE = Object.fromEntries(Object.entries(ROUTES).map(([v, r]) => [r, v]));
+  BY_ROUTE['#/profil/einstellungen'] = 'account';          // frühere Adresse der Einstellungen
   // Unterseiten: gehören zu einer Seite, von der aus man sie öffnet
-  const PARENT = { profile: 'me', settings: 'me' };
+  const PARENT = { profile: 'me', account: 'me', notify: 'me', admin: 'me' };
   // ?view=… aus Push-Benachrichtigungen und älteren Links
-  const LEGACY = { settings: 'settings', groups: 'groups', rated: 'rated', profile: 'profile',
+  const LEGACY = { settings: 'profile',   // nur die Profil-Erinnerung verlinkte ?view=settings
+                   notify: 'notify', account: 'account', groups: 'groups', rated: 'rated', profile: 'profile',
                    jobs: 'jobs', search: 'jobs', add: 'add', archive: 'archive', more: 'me', me: 'me' };
 
   const isSub = v => v in PARENT;

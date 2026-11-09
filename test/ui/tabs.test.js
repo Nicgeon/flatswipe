@@ -32,7 +32,8 @@ const B=BASE;
     }
     // Profil page
     await page.click('.tab-nav[data-tab="me"]'); await page.waitForTimeout(500);
-    ok((await page.locator('#view-me .mh-row').count())===2,`${L}: 2 rows on Profil page`);
+    ok((await page.locator('#view-me .mh-row:not([hidden])').count())===4,`${L}: 4 rows on Profil page (Anna is admin)`);
+    ok((await page.textContent('#mh-notify-sub')).length>0&&/^\d+$/.test((await page.textContent('#stat-likes')).trim()),`${L}: status line + stats on Profil page`);
     ok((await page.locator('#view-me .mh-group').allTextContents()).join('|')==='Darstellung',`${L}: only "Darstellung" group left`);
     ok((await page.textContent('#me-name')).trim()==='Anna'&&(await page.textContent('#me-email')).includes('@'),`${L}: name + email on Profil page`);
     ok((await page.locator('#logout-btn').count())===1&&(await page.locator('#settings-logout-btn').count())===0,`${L}: logout exists exactly once`);
@@ -44,11 +45,14 @@ const B=BASE;
     await page.click('.tab-nav[data-tab="swipe"]'); await page.waitForTimeout(300);
     await page.click('#account-btn'); await page.waitForTimeout(400);
     ok(await vis('#view-me')&&await page.evaluate(()=>document.getElementById('account-btn').classList.contains('on')),`${L}: avatar → Profil, ring on`);
-    // Settings keeps Profil highlighted; back button returns to Profil
-    await page.click('#view-me [data-goto="settings"]'); await page.waitForTimeout(400);
-    ok(await act()==='me'&&await vis('#view-settings'),`${L}: Settings highlights Profil`);
-    await page.click('#view-settings [data-back]'); await page.waitForTimeout(400);
-    ok(await vis('#view-me'),`${L}: Settings back → Profil`);
+    // sub-pages keep Profil highlighted; back button returns to Profil
+    for (const v of ['notify','account','admin']) {
+      await page.click(`#view-me [data-goto="${v}"]`); await page.waitForTimeout(400);
+      ok(await act()==='me'&&await vis('#view-'+v),`${L}: ${v} highlights Profil`);
+      if (v==='admin') ok((await page.locator('#admin-users-list .admin-user-row').count())>=1,`${L}: user list shown right away`);
+      await page.click(`#view-${v} [data-back]`); await page.waitForTimeout(400);
+      ok(await vis('#view-me'),`${L}: ${v} back → Profil`);
+    }
     await page.click('#logout-btn'); await page.waitForTimeout(600);
     ok(await vis('#login-form')||await vis('.auth-tabs'),`${L}: logout on Profil page`);
     await ctx.close();

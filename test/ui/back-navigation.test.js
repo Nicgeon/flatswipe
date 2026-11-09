@@ -27,10 +27,10 @@ const { chromium, launchOptions } = require('../helpers/browser');
  await back(); s=await st(); ok(s.v==='view-swipe','back from Suche → home');
  // Profil → Einstellungen
  await tab('me'); s=await st(); ok(s.v==='view-me'&&s.hash==='#/profil','me '+JSON.stringify(s));
- await page.click('#view-me [data-goto="settings"]'); await wait(300); s=await st(); ok(s.v==='view-settings'&&s.tab==='me'&&s.trail==='swipe>me>settings','settings '+JSON.stringify(s));
+ await page.click('#view-me [data-goto="notify"]'); await wait(300); s=await st(); ok(s.v==='view-notify'&&s.tab==='me'&&s.trail==='swipe>me>notify'&&s.hash==='#/profil/benachrichtigungen','notify '+JSON.stringify(s));
  await back(); s=await st(); ok(s.v==='view-me'&&s.trail==='swipe>me','back → Profil hub '+JSON.stringify(s));
- await page.click('#view-me [data-goto="settings"]'); await wait(300);
- await page.click('#view-settings [data-back]'); await wait(350); s=await st(); ok(s.v==='view-me'&&s.trail==='swipe>me','Zurück-Knopf → hub '+JSON.stringify(s));
+ await page.click('#view-me [data-goto="account"]'); await wait(300);
+ await page.click('#view-account [data-back]'); await wait(350); s=await st(); ok(s.v==='view-me'&&s.trail==='swipe>me','Zurück-Knopf → hub '+JSON.stringify(s));
  await page.click('#view-me [data-goto="profile"]'); await wait(500); s=await st(); ok(s.v==='view-profile'&&s.trail==='swipe>me>profile','profile page '+JSON.stringify(s));
  await tab('rated'); s=await st(); ok(s.v==='view-rated'&&s.trail==='swipe>rated','tab from sub-page replaces it '+JSON.stringify(s));
  await back(); s=await st(); ok(s.v==='view-swipe','back after that → home');
@@ -67,8 +67,9 @@ const { chromium, launchOptions } = require('../helpers/browser');
  // deep links
  await page.goto('about:blank'); await page.goto(BASE+'/#/suche/archiv'); await page.waitForSelector('.view.active',{timeout:5000}); await wait(600); s=await st(); ok(s.v==='view-archive'&&s.trail==='swipe>archive','deep link archiv '+JSON.stringify(s));
  await back(); s=await st(); ok(s.v==='view-swipe','back from deep link → home');
- await page.goto(BASE+'/?view=settings'); await wait(800); s=await st(); ok(s.v==='view-settings'&&s.trail==='swipe>me>settings'&&!(await page.evaluate(()=>location.search)),'push link ?view=settings '+JSON.stringify(s));
+ await page.goto(BASE+'/?view=profile'); await wait(800); s=await st(); ok(s.v==='view-profile'&&s.trail==='swipe>me>profile'&&!(await page.evaluate(()=>location.search)),'push link ?view=profile '+JSON.stringify(s));
  await back(); s=await st(); ok(s.v==='view-me','back → hub'); await back(); s=await st(); ok(s.v==='view-swipe','back → home');
+ await page.goto('about:blank'); await page.goto(BASE+'/#/profil/einstellungen'); await wait(800); s=await st(); ok(s.v==='view-account'&&s.trail==='swipe>me>account','old address #/profil/einstellungen → Konto '+JSON.stringify(s));
  // logout/login resets cleanly
  await tab('me'); await page.click('#logout-btn'); await wait(500);
  ok(await page.$eval('#auth-screen',e=>e.classList.contains('active')),'logged out');
