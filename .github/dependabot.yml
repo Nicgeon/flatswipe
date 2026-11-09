@@ -1,0 +1,39 @@
+# Dependabot schlägt Updates als Pull-Request auf main vor – einmal pro Woche,
+# zusammengefasst, damit nicht jedes Paket einen eigenen PR bekommt.
+# Sicherheitsupdates kommen unabhängig davon sofort (falls in den Settings aktiviert).
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      npm-minor-patch:
+        update-types: [minor, patch]
+    commit-message:
+      prefix: "npm"
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "actions"
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    ignore:
+      # Wechsel der Node-Hauptversion (22 → 24) bewusst von Hand
+      - dependency-name: node
+        update-types: ["version-update:semver-major"]
+    commit-message:
+      prefix: "docker"
