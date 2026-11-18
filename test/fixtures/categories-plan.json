@@ -1,0 +1,10 @@
+{
+  "Autos": [
+    {"url":"https://www.kleinanzeigen.de/s-anzeige/golf/1-216-1","platform":"kleinanzeigen","category":"auto","title":"VW Golf 7 1.4 TSI","price":"12.500 € VB","location":"28199 Bremen - Neustadt","description":"Gepflegter Golf.","attrs_json":"{\"kilometerstand\":\"85.000 km\",\"erstzulassung\":\"03/2018\",\"kraftstoff\":\"Benzin\",\"BÖSE KEY\":\"x\",\"leistung\":{\"nested\":1}}"},
+    {"url":"https://www.immowelt.de/expose/auto-twin","platform":"immowelt","category":"auto","title":"VW Golf 7 (andere Plattform)","price":"12.500 €","size":"58 m²","rooms":"2","location":"28199 Bremen"}
+  ],
+  "Wohnungen": [
+    {"url":"https://www.kleinanzeigen.de/s-anzeige/w1/2-203-1","platform":"kleinanzeigen","title":"2-Zimmer Neustadt","price_cold":"700 €","price":"850 €","size":"58 m²","rooms":"2","location":"28199 Bremen"},
+    {"url":"https://www.immowelt.de/expose/w1","platform":"immowelt","title":"2-Zi. Neustadt","price_cold":"700 €","size":"58 m²","rooms":"2","location":"28199 Bremen"}
+  ]
+}

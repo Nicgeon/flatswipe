@@ -726,8 +726,9 @@ const messageModal = {
   close() { this._contact?.destroy(); this._contact = null; $id('message-modal').style.display = 'none'; this.listing = null; },
 
   listingHtml(l) {
-    const bits = [(l.price_cold || '').trim() && `${esc(l.price_cold)} kalt`, (l.price || '').trim() && `${esc(l.price)} warm`,
-      l.size && esc(l.size), l.rooms && `${esc(l.rooms)} Zimmer`, l.location && esc(l.location)].filter(Boolean);
+    const p = Categories.priceParts(l);
+    const bits = [p.main && `${esc(p.main)}${p.note ? ` ${esc(p.note)}` : ''}`, p.alt && `${esc(p.alt)} ${esc(p.altNote)}`,
+      ...Categories.facts(l).map(f => esc(f.text)), l.location && esc(l.location)].filter(Boolean);
     return `<div class="msg-listing-title">${esc(l.title || 'Inserat')}</div>${bits.length ? `<div class="msg-listing-meta">${bits.join(' · ')}</div>` : ''}`;
   },
 

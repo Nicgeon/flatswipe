@@ -16,6 +16,7 @@ const crypto     = require('crypto');
 const MemoryStore = require('memorystore')(session);
 const webpush    = require('web-push');
 const { computeClusters } = require('./dedupe');
+const Categories = require('../public/js/categories');
 const { pollSearchJob, checkExistingListings, detectPlatform, scrapeListing, validateSearchUrl, isUrlAllowed, safeAgentFor, safeHttpsAgent } = require('./poller');
 const mailer     = require('./mailer');
 const P          = require('./profile');
@@ -385,6 +386,11 @@ async function initDb() {
   // "source", and the listing is visible to everyone who may see at least one of them.
   // cluster_id groups copies of the same flat from different portals (see dedupe.js).
   migrate("ALTER TABLE listings    ADD COLUMN cluster_id      INTEGER");
+  // Kategorien (public/js/categories.js): was ein Inserat ist; Felder außer den Wohnungsspalten
+  // stehen in attrs_json. Alles, was es vorher gab, sind Wohnungen.
+  migrate("ALTER TABLE listings    ADD COLUMN category        TEXT DEFAULT 'wohnung'");
+  migrate("ALTER TABLE listings    ADD COLUMN attrs_json      TEXT DEFAULT '{}'");
+  migrate("ALTER TABLE search_jobs ADD COLUMN category        TEXT DEFAULT 'wohnung'");
   db.exec(`
     CREATE TABLE IF NOT EXISTS listing_sources (
       listing_id    INTEGER NOT NULL,
@@ -460,19 +466,35 @@ function addListingSource(listingId, { jobId = null, addedBy = null, visibility 
 
 // A URL that is already known gets the new source added instead of being skipped — before, a flat
 // stayed with whoever found it first (e.g. someone's private agent) and a group's agent never saw it.
+// Zusatzangaben (attrs_json) als JSON-Text: nur kurze Text-/Zahlwerte, höchstens 40 Felder
+function cleanAttrs(raw) {
+  let o = raw;
+  if (typeof o === 'string') { try { o = JSON.parse(o); } catch (_) { o = {}; } }
+  if (!o || typeof o !== 'object' || Array.isArray(o)) return '{}';
+  const out = {};
+  for (const [k, v] of Object.entries(o).slice(0, 40)) {
+    if (!/^[a-z0-9_]{1,40}$/.test(k) || (typeof v !== 'string' && typeof v !== 'number')) continue;
+    const t = String(v).trim().substring(0, 200);
+    if (t) out[k] = t;
+  }
+  return JSON.stringify(out);
+}
+
 function insertListing(data, addedBy = null, sourceJobId = null, visibility = 'global', visibilityId = null) {
   const source = { jobId: sourceJobId, addedBy, visibility, visibilityId };
   const ex = dbGet('SELECT id FROM listings WHERE url=?', [data.url]);
   if (ex) return { id: ex.id, isNew: false, linked: addListingSource(ex.id, source) };
+  const category = Categories.isCategory(data.category) ? data.category : Categories.DEFAULT;
   const r = dbRun(
-    'INSERT INTO listings (url,title,price,price_cold,size,location,rooms,image_url,images_json,tags_json,description,platform,status,added_by,source_job_id,visibility,visibility_id,nebenkosten,heizkosten,kaution,available_from,property_type,latitude,longitude) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+    'INSERT INTO listings (url,title,price,price_cold,size,location,rooms,image_url,images_json,tags_json,description,platform,status,added_by,source_job_id,visibility,visibility_id,nebenkosten,heizkosten,kaution,available_from,property_type,latitude,longitude,category,attrs_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
     [data.url, data.title||'', data.price||'', data.price_cold||'', data.size||'',
      data.location||'', data.rooms||'', data.image_url||'', data.images_json||'[]',
      data.tags_json||'[]', data.description||'', data.platform||'unbekannt',
      data.status||'active', addedBy, sourceJobId, visibility, visibilityId,
      data.nebenkosten||'', data.heizkosten||'', data.kaution||'', data.available_from||'', data.property_type||'',
      Number.isFinite(data.latitude) ? data.latitude : null,
-     Number.isFinite(data.longitude) ? data.longitude : null]
+     Number.isFinite(data.longitude) ? data.longitude : null,
+     category, cleanAttrs(data.attrs_json || data.attrs)]
   );
   addListingSource(r.lastInsertRowid, source);
   return { id: r.lastInsertRowid, isNew: true, linked: true };
@@ -519,7 +541,8 @@ function attachAlsoOn(listings, uid) {
 
 // Re-groups copies of the same flat (dedupe.js) and stores the result in listings.cluster_id.
 function recomputeClusters() {
-  const rows = dbAll('SELECT id,url,platform,size,rooms,price,price_cold,location,description,latitude,longitude,cluster_id FROM listings');
+  // Die Duplikat-Regeln (Fläche, Zimmer, Miete) gibt es bisher nur für Wohnungen
+  const rows = dbAll("SELECT id,url,platform,size,rooms,price,price_cold,location,description,latitude,longitude,cluster_id FROM listings WHERE COALESCE(category,'wohnung')='wohnung'");
   const notPairs = dbAll('SELECT a, b FROM listing_not_duplicates').map(r => [r.a, r.b]);
   const clusters = computeClusters(rows, notPairs);
   let changed = 0;
@@ -2101,6 +2124,7 @@ app.get('/api/groups/:id/results', requireAuth, (req, res) => {
       byId[l.id] = {
         id: l.id, cluster_id: l.cluster_id, title: l.title, price: l.price, price_cold: l.price_cold,
         size: l.size, location: l.location, rooms: l.rooms, status: l.status,
+        category: l.category, attrs_json: l.attrs_json,
         image_url: l.image_url, images_json: l.images_json, tags_json: l.tags_json,
         url: l.url, platform: l.platform, votes: [], score: 0,
         group_contacted: c ? 1 : 0, group_contact_note: c ? c.note : null, group_contacted_at: c ? c.contacted_at : null,
@@ -2341,7 +2365,7 @@ async function runJob(job) {
         if (ex && addListingSource(ex.id, { jobId: job.id })) linked++;
         return !!ex;
       },
-      (data) => { const r = insertListing(data, job.added_by, job.id); if (r.isNew) insertedIds.push(r.id); }
+      (data) => { const r = insertListing({ category: job.category, ...data }, job.added_by, job.id); if (r.isNew) insertedIds.push(r.id); }
     );
     if (insertedIds.length || linked) recomputeClusters();
     // "New" means a new flat: a copy of a flat that was already known from another portal is not
@@ -2414,9 +2438,6 @@ async function notifyListingWatchers(listingId, title, body) {
   }
 }
 
-const CHANGE_FIELD_LABELS = {
-  title: 'Titel', price: 'Warmmiete', price_cold: 'Kaltmiete', size: 'Größe', rooms: 'Zimmer',
-};
 
 // ── Status checker (runs every 6h) ────────────────────────
 // Re-scrapes every active listing to catch two kinds of updates:
@@ -2457,7 +2478,7 @@ async function runStatusCheck() {
       const priceChange = fieldChanges.find(c => c.field === 'price' || c.field === 'price_cold');
       const titleChange = fieldChanges.find(c => c.field === 'title');
       if (priceChange) {
-        const label = CHANGE_FIELD_LABELS[priceChange.field];
+        const label = Categories.changeLabel(dbGet('SELECT category FROM listings WHERE id=?', [id]), priceChange.field);
         notifyListingWatchers(id, `💶 ${label} geändert`, `${fresh.title || ''}: ${priceChange.oldVal} → ${priceChange.newVal}`).catch(() => {});
       } else if (titleChange) {
         notifyListingWatchers(id, '✏️ Titel geändert', `${titleChange.oldVal} → ${titleChange.newVal}`).catch(() => {});

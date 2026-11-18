@@ -21,14 +21,16 @@ const withUi = process.argv.includes('--ui');
 const filters = process.argv.slice(2).filter(a => !a.startsWith('--'));
 const shotDir = fs.mkdtempSync(path.join(os.tmpdir(), 'flatswipe-shots-'));
 const dupPlan = JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures', 'duplicates-plan.json'), 'utf8'));
+const catPlan = JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures', 'categories-plan.json'), 'utf8'));
 
 // [file, server setup, extra args]
 const TESTS = [
   ['unit/dedupe.test.js'], ['unit/template.test.js'], ['unit/introduction.test.js'],
-  ['unit/formatting.test.js'], ['unit/documents.test.js'],
+  ['unit/formatting.test.js'], ['unit/documents.test.js'], ['unit/categories.test.js'],
   ['api/core.test.js', { seed: true }],
   ['api/admin-cli.test.js', { seed: true }],
   ['api/limits.test.js', {}],
+  ['api/categories.test.js', { plan: catPlan }],
   ['api/duplicates.test.js', { plan: dupPlan }],
 ];
 if (withUi) for (const size of [['390', '844'], ['1440', '900']]) TESTS.push(
@@ -36,7 +38,7 @@ if (withUi) for (const size of [['390', '844'], ['1440', '900']]) TESTS.push(
   ['ui/rate-in-detail.test.js', { seed: true }, size],
   ['ui/duplicates.test.js', { plan: dupPlan }, size],
 );
-if (withUi) TESTS.push(['ui/tabs.test.js', { seed: true }], ['ui/shared-link.test.js', { seed: true }], ['ui/search-sheets.test.js', { seed: true }], ['ui/detail-actions.test.js', { seed: true }]);
+if (withUi) TESTS.push(['ui/tabs.test.js', { seed: true }], ['ui/shared-link.test.js', { seed: true }], ['ui/search-sheets.test.js', { seed: true }], ['ui/detail-actions.test.js', { seed: true }], ['ui/categories.test.js', { plan: catPlan }]);
 
 const FAILED = /^\s*✗|^\s*FAIL\b|\b[1-9]\d* (?:FAILS|failed)\b|fails: [1-9]|errors?: \[\s*"|^ERR\b|Error:/m;
 

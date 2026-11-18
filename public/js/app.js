@@ -76,21 +76,17 @@ function parseImages(listing) {
   try { return JSON.parse(listing.images_json || '[]'); } catch { return listing.image_url ? [listing.image_url] : []; }
 }
 
-function priceHtml(listing, large = false) {
-  const cold  = (listing.price_cold || '').trim();
-  const total = (listing.price      || '').trim();
-  if (!cold && !total) return '';
-  const mainSize = large ? 'font-size:1.1rem' : '';
-  let html = `<div class="card-price-row">`;
-  if (cold) {
-    html += `<span class="card-price-main" style="${mainSize}">${esc(cold)}</span>`;
-    html += `<span class="price-tag-cold">Kalt</span>`;
-    if (total && total !== cold) html += `<span class="price-tag-warm">${esc(total)} warm</span>`;
-  } else {
-    html += `<span class="card-price-main" style="${mainSize}">${esc(total)}</span>`;
-  }
-  return html + '</div>';
+// Preis und Eckdaten kommen aus der Kategorie-Beschreibung (categories.js): Wohnung "700 € kalt · 850 € warm",
+// Auto "12.500 €" usw.
+const Cat = window.Categories;
+// "kalt · 850 € warm" (escaped HTML, '' ohne Zusatz)
+function priceNoteHtml(listing) {
+  const p = Cat.priceParts(listing);
+  return p.note ? `${esc(p.note)}${p.alt ? ` · ${esc(p.alt)} ${esc(p.altNote)}` : ''}` : '';
 }
+// Chips aus der Kategorie: cls = CSS-Klasse je Chip, withIcon = Symbol davor
+const factChips = (listing, cls, withIcon = true) =>
+  Cat.facts(listing).map(f => `<span class="${cls}">${withIcon ? icon(f.icon, 'sm') : ''}${esc(f.text)}</span>`).join('');
 
 // ── Screens ───────────────────────────────────────────────
 function showScreen(id) {
@@ -368,19 +364,9 @@ function mountContactBar(el, listingId, groupId) {
 
 // Kosten / Details lists, shared by the detail view and the desktop quick view.
 function listingLists(listing) {
-  const cold  = (listing.price_cold || '').trim();
-  const total = (listing.price      || '').trim();
-  const costRows = [
-    ['Kaltmiete',      cold],
-    ['Nebenkosten',    listing.nebenkosten],
-    ['Heizkosten',     listing.heizkosten],
-    ['Kaution',        listing.kaution],
-  ].filter(([, v]) => v && v.trim());
-  if (cold && total && total !== cold) costRows.push(['Warmmiete', total, true]);
-  const factRows = [
-    ['Wohnungstyp',    listing.property_type],
-    ['Verfügbar ab',   listing.available_from],
-  ].filter(([, v]) => v && v.trim());
+  const { costs, total, details } = Cat.lists(listing);
+  const costRows = total ? [...costs, [...total, true]] : costs;
+  const factRows = details;
   const list = rows => `<ul class="detail-list">${rows.map(([l, v, isTotal]) =>
     `<li${isTotal ? ' class="total"' : ''}><span>${esc(l)}</span><b>${esc(v)}</b></li>`).join('')}</ul>`;
   return {
@@ -431,20 +417,16 @@ const detailView = {
     this._renderAlsoOn();
     $id('detail-title').textContent    = listing.title || 'Inserat';
 
-    const cold  = (listing.price_cold || '').trim();
-    const total = (listing.price      || '').trim();
-    $id('detail-price').innerHTML = cold
-      ? `<b>${esc(cold)}</b><span>kalt${total && total !== cold ? ` · ${esc(total)} warm` : ''}</span>`
-      : (total ? `<b>${esc(total)}</b>` : '<span>Preis nicht angegeben</span>');
+    const price = Cat.priceParts(listing).main;
+    $id('detail-price').innerHTML = price
+      ? `<b>${esc(price)}</b>${priceNoteHtml(listing) ? `<span>${priceNoteHtml(listing)}</span>` : ''}`
+      : '<span>Preis nicht angegeben</span>';
 
     const locEl = $id('detail-loc');
     locEl.innerHTML = listing.location ? `${icon('pin', 'sm')}${esc(listing.location)}` : '';
     locEl.style.display = listing.location ? '' : 'none';
 
-    const metaParts = [];
-    if (listing.size)  metaParts.push(`${icon('area', 'sm')}${esc(listing.size)}`);
-    if (listing.rooms) metaParts.push(`${icon('door', 'sm')}${esc(listing.rooms)} Zi.`);
-    $id('detail-meta').innerHTML = metaParts.map(m => `<span class="detail-meta-item">${m}</span>`).join('');
+    $id('detail-meta').innerHTML = factChips(listing, 'detail-meta-item');
 
     // Cost list (Kosten) and a second list for the remaining facts (Details).
     // Only rendered when at least one field was actually scraped, so older
@@ -599,7 +581,6 @@ const detailView = {
   async _loadChanges(listingId) {
     const el = $id('detail-changes');
     el.style.display = 'none'; el.innerHTML = '';
-    const fieldLabels = { title: 'Titel', price: 'Warmmiete', price_cold: 'Kaltmiete', size: 'Größe', rooms: 'Zimmer' };
     try {
       const { changes = [] } = await api(`/api/listings/${listingId}/changes`);
       if (!changes.length) return;
@@ -610,7 +591,7 @@ const detailView = {
       el.innerHTML = `
         <div class="detail-section-label">Änderungsverlauf</div>
         ${changes.slice(0, 8).map(c => {
-          const label = fieldLabels[c.field] || c.field;
+          const label = Cat.changeLabel(this.listing, c.field);
           const date  = new Date(c.changed_at + 'Z').toLocaleDateString('de-DE', { day: '2-digit', month: '2-digit', year: 'numeric' });
           return `<div class="detail-change-row">
             <span class="detail-change-date">${date}</span>
@@ -680,7 +661,7 @@ $id('detail-quick-share').onclick = async () => {
   if (!detailView.listing) return;
   const shareUrl   = `${location.origin}${location.pathname}?listing=${detailView.listing.id}`;
   const shareTitle = detailView.listing.title || 'Inserat';
-  const priceStr   = detailView.listing.price_cold || detailView.listing.price || '';
+  const priceStr   = Cat.priceParts(detailView.listing).main;
   const shareText  = priceStr ? `${shareTitle} – ${priceStr}` : shareTitle;
 
   if (navigator.share) {
@@ -789,14 +770,9 @@ function buildSwipeCard(listing) {
   const statusBadge = listing.status === 'reserved'
     ? `<div class="card-status-badge status-reserved">Reserviert</div>` : '';
 
-  const cold  = (listing.price_cold || '').trim();
-  const total = (listing.price      || '').trim();
-  const mainPrice = cold || total;
-  const priceSub  = cold ? `kalt${total && total !== cold ? ` · ${esc(total)} warm` : ''}` : '';
-  const facts = [
-    listing.size  ? `<span class="card-fact">${icon('area', 'sm')}${esc(listing.size)}</span>` : '',
-    listing.rooms ? `<span class="card-fact">${icon('door', 'sm')}${esc(listing.rooms)} Zi.</span>` : '',
-  ].join('');
+  const mainPrice = Cat.priceParts(listing).main;
+  const priceSub  = priceNoteHtml(listing);
+  const facts = factChips(listing, 'card-fact');
   const shownTags = tags.slice(0, 3);
 
   card.innerHTML = `
@@ -864,8 +840,8 @@ function buildListCard(listing, opts = {}) {
   const images = parseImages(listing);
   const hasImg = images[0]?.startsWith('http');
   const tags   = parseTags(listing.tags_json).slice(0, 4);
-  const cold   = (listing.price_cold || '').trim();
-  const total  = (listing.price      || '').trim();
+  const mainPrice = Cat.priceParts(listing).main;
+  const priceBlock = mainPrice ? `<b>${esc(mainPrice)}</b><span>${priceNoteHtml(listing)}</span>` : '';
   const swipe  = listing.my_swipe;
     const cardUid = `lc_${listing.id}_${Math.random().toString(36).slice(2,7)}`;
 
@@ -933,17 +909,16 @@ function buildListCard(listing, opts = {}) {
         ${rate ? `<span class="rc-rate ${swipe}">${icon(rate[0], 'sm')}<span class="rc-rate-label">${rate[1]}</span></span>` : ''}
         ${listing.status === 'offline'  ? `<span class="rc-strip">Offline</span>` : ''}
         ${listing.status === 'reserved' ? `<span class="rc-strip res">Reserviert</span>` : ''}
-        <div class="rc-price-over">${(cold || total) ? `<b>${esc(cold || total)}</b><span>${cold ? 'kalt' + (total && total !== cold ? ` · ${esc(total)} warm` : '') : ''}</span>` : ''}</div>
+        <div class="rc-price-over">${priceBlock}</div>
       </div>
       <button class="card-menu-btn" data-menu-toggle title="Optionen" aria-label="Optionen">${icon('dots')}</button>
       ${menuHtml}
       <div class="list-card-body rc-body">
         <div class="list-card-title">${esc(listing.title || 'Inserat')}</div>
-        <div class="rc-price">${(cold || total) ? `<b>${esc(cold || total)}</b><span>${cold ? 'kalt' + (total && total !== cold ? ` · ${esc(total)} warm` : '') : ''}</span>` : ''}</div>
+        <div class="rc-price">${priceBlock}</div>
         ${listing.location ? `<div class="rc-loc">${icon('pin', 'sm')}<span>${esc(listing.location)}</span></div>` : ''}
         <div class="rc-facts">
-          ${listing.size  ? `<span class="rc-chip">${esc(listing.size)}</span>` : ''}
-          ${listing.rooms ? `<span class="rc-chip">${esc(listing.rooms)} Zi.</span>` : ''}
+          ${factChips(listing, 'rc-chip', false)}
           ${listing.also_on?.length ? `<span class="rc-chip" title="${esc(listing.also_on.map(a => platformName(a.platform)).join(', '))}">${icon('copy', 'sm')}+${listing.also_on.length} Portal${listing.also_on.length > 1 ? 'e' : ''}</span>` : ''}
           ${listing.status === 'reserved' ? `<span class="rc-chip warn">Reserviert</span>` : ''}
           ${listing.status === 'offline'  ? `<span class="rc-chip bad">Nicht mehr verfügbar</span>` : ''}
@@ -1692,13 +1667,8 @@ async function loadRated() {
   renderRated();
 }
 
-// "700 €" / "1.150 €" / "1.150,50 €" → number (Infinity when there is no price, so those sort last)
-function priceNumber(l) {
-  const raw = (l.price_cold || l.price || '').replace(/[^\d.,]/g, '');
-  if (!raw) return Infinity;
-  const n = parseFloat(raw.replace(/\./g, '').replace(',', '.'));
-  return Number.isFinite(n) ? n : Infinity;
-}
+// Hauptpreis als Zahl (Infinity ohne Preis, die landen beim Sortieren hinten)
+const priceNumber = l => Cat.priceNumber(l);
 
 function ratedVisible() {
   const filter = state.ratedFilter;
