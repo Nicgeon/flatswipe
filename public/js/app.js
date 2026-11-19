@@ -2060,6 +2060,7 @@ function buildJobCard(job) {
         <div class="job-card-url">${esc(job.search_url)}</div>
         <div class="job-badges">
           <span class="job-badge platform-${esc(job.platform)}">${esc(job.platform)}</span>
+          ${job.category && job.category !== 'wohnung' ? `<span class="job-badge job-badge-cat">${icon(Cat.CATEGORIES[job.category]?.icon || 'grid', 'sm')}${esc(Cat.CATEGORIES[job.category]?.label || job.category)}</span>` : ''}
           <span class="job-badge status-${status}">${statusLabel}</span>
           <span class="job-badge job-badge-vis">${visLabel}</span>
         </div>

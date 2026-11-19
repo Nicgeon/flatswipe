@@ -17,7 +17,7 @@ const MemoryStore = require('memorystore')(session);
 const webpush    = require('web-push');
 const { computeClusters } = require('./dedupe');
 const Categories = require('../public/js/categories');
-const { pollSearchJob, checkExistingListings, detectPlatform, scrapeListing, validateSearchUrl, isUrlAllowed, safeAgentFor, safeHttpsAgent } = require('./poller');
+const { pollSearchJob, checkExistingListings, detectPlatform, detectCategory, scrapeListing, validateSearchUrl, isUrlAllowed, safeAgentFor, safeHttpsAgent } = require('./poller');
 const mailer     = require('./mailer');
 const P          = require('./profile');
 
@@ -2204,8 +2204,8 @@ app.post('/api/jobs', requireAuth, (req, res) => {
     const member = dbGet('SELECT 1 FROM group_members WHERE group_id=? AND user_id=?', [visId, req.session.userId]);
     if (!member) return res.status(403).json({ error: 'Nicht Mitglied dieser Gruppe' });
   }
-  const r  = dbRun('INSERT INTO search_jobs (label,search_url,platform,interval_min,added_by,visibility,visibility_id) VALUES (?,?,?,?,?,?,?)',
-    [label.trim(), search_url.trim(), detectPlatform(search_url), iv, req.session.userId, vis, visId]);
+  const r  = dbRun('INSERT INTO search_jobs (label,search_url,platform,category,interval_min,added_by,visibility,visibility_id) VALUES (?,?,?,?,?,?,?,?)',
+    [label.trim(), search_url.trim(), detectPlatform(search_url), detectCategory(search_url), iv, req.session.userId, vis, visId]);
   saveDb();
   res.json({ success: true, job: dbGet('SELECT * FROM search_jobs WHERE id=?', [r.lastInsertRowid]) });
 });

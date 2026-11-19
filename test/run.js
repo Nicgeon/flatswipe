@@ -26,7 +26,7 @@ const catPlan = JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures', 'cat
 // [file, server setup, extra args]
 const TESTS = [
   ['unit/dedupe.test.js'], ['unit/template.test.js'], ['unit/introduction.test.js'],
-  ['unit/formatting.test.js'], ['unit/documents.test.js'], ['unit/categories.test.js'],
+  ['unit/formatting.test.js'], ['unit/documents.test.js'], ['unit/categories.test.js'], ['unit/kleinanzeigen.test.js'], ['unit/kleinanzeigen-scrape.test.js'],
   ['api/core.test.js', { seed: true }],
   ['api/admin-cli.test.js', { seed: true }],
   ['api/limits.test.js', {}],

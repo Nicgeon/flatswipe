@@ -1344,8 +1344,8 @@ body.rated-selecting #view-rated .view-content { padding-bottom:150px; }
 .vote-chip .ic { width:13px; height:13px; stroke-width:2.2; }
 .job-actions button { display:inline-flex; align-items:center; gap:6px; }
 .job-actions button .ic { width:15px; height:15px; }
-.job-badge-vis { display:inline-flex; align-items:center; gap:4px; color:var(--text2); border-color:var(--border); }
-.job-badge-vis .ic { width:12px; height:12px; }
+.job-badge-vis, .job-badge-cat { display:inline-flex; align-items:center; gap:4px; color:var(--text2); border-color:var(--border); }
+.job-badge-vis .ic, .job-badge-cat .ic { width:12px; height:12px; }
 .job-error { display:flex; gap:8px; align-items:flex-start; }
 .job-error .ic { width:15px; height:15px; margin-top:1px; }
 .contacted-badge .ic, .archive-ts .ic { width:13px; height:13px; }

@@ -10,10 +10,15 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 (async () => {
   const A = client();
   await A('POST', '/api/auth/register', { username: 'Cara', email: 'cara@x.de', password: 'secret123' });
+  const jobs = {};
   for (const [label, url] of [['Autos', 'https://www.kleinanzeigen.de/s-autos/bremen/c216l1r20'], ['Wohnungen', 'https://www.kleinanzeigen.de/s-wohnung-mieten/bremen/c203l1']]) {
     const { job } = await A('POST', '/api/jobs', { label, search_url: url, visibility: 'global' });
+    jobs[label] = job;
     await A('POST', `/api/jobs/${job.id}/run`);
   }
+  ok(jobs.Autos.category === 'auto' && jobs.Wohnungen.category === 'wohnung', 'new agents get their category from the search URL (c216 → auto, c203 → wohnung)');
+  const other = (await A('POST', '/api/jobs', { label: 'Räder', search_url: 'https://www.kleinanzeigen.de/s-fahrraeder/bremen/c217l1r10' })).job;
+  ok(other.category === 'sonstiges', 'other Kleinanzeigen categories → sonstiges');
   let q = [];
   for (let i = 0; i < 50 && q.length < 3; i++) { await sleep(100); q = (await A('GET', '/api/listings/swipe')).listings || []; }
   const car = q.find(l => l.title === 'VW Golf 7 1.4 TSI');
@@ -25,6 +30,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
   ok(flats.length === 1 && flats[0].also_on.length === 1, 'the two flat copies are merged into one (dedupe still works for flats)');
   const twin = q.find(l => l.title.startsWith('VW Golf 7 (andere'));
   ok(car && twin && !car.cluster_id && !twin.cluster_id, 'cars are not merged by the flat rules (same "size/rooms/place")');
+  ok(twin && twin.category === 'auto', 'a listing without its own category gets the agent\'s category');
   ok(q.length === 3, `stack: 2 cars + 1 flat (${q.length})`);
   const detail = (await A('GET', `/api/listings/${car.id}`)).listing;
   ok(detail.category === 'auto' && detail.attrs_json.includes('kilometerstand'), 'detail endpoint returns category and attrs');

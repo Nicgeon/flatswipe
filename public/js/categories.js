@@ -9,6 +9,8 @@
  *   costs    Liste „Kosten“ in der Detailansicht, `total` als hervorgehobene Summe
  *   details  Liste „Details“ in der Detailansicht
  *   changes  Feldnamen für den Änderungsverlauf
+ *   kleinanzeigen  Kategorie-IDs bei Kleinanzeigen (aus Such- und Anzeigen-URLs, siehe
+ *            docs/kleinanzeigen-suche.md); alles ohne Zuordnung ist „Sonstiges“
  *
  * Ein Feldschlüssel ist eine Spalte von `listings` (Wohnungen haben eigene Spalten) oder
  * `attr:<name>` für die Zusatzangaben in `listings.attrs_json` (alle anderen Kategorien).
@@ -25,6 +27,9 @@
       total:   ['Warmmiete', 'price'],
       details: [['Wohnungstyp', 'property_type'], ['Verfügbar ab', 'available_from']],
       changes: { title: 'Titel', price: 'Warmmiete', price_cold: 'Kaltmiete', size: 'Größe', rooms: 'Zimmer' },
+      // Immobilien, Eigentumswohnungen, Auf Zeit & WG, Mietwohnungen, Häuser zur Miete/zum Kauf,
+      // Ferien- & Auslandsimmobilien, Neubauprojekte
+      kleinanzeigen: [195, 196, 199, 203, 205, 208, 275, 403],
     },
     auto: {
       label: 'Autos', one: 'Auto', icon: 'car',
@@ -34,6 +39,7 @@
       details: [['Marke', 'attr:marke'], ['Modell', 'attr:modell'], ['Leistung', 'attr:leistung'], ['Kraftstoff', 'attr:kraftstoff'],
                 ['Getriebe', 'attr:getriebe'], ['Fahrzeugtyp', 'attr:fahrzeugtyp'], ['HU bis', 'attr:hu']],
       changes: { title: 'Titel', price: 'Preis' },
+      kleinanzeigen: [216],
     },
     sonstiges: {
       label: 'Sonstiges', one: 'Inserat', icon: 'grid',
@@ -106,7 +112,14 @@
 
   const changeLabel = (listing, field) => categoryOf(listing).changes[field] || field;
 
-  const api = { CATEGORIES, DEFAULT, categoryOf, isCategory, attrs, value, priceParts, priceNumber, facts, lists, changeLabel };
+  // Kategorie zu einer Kleinanzeigen-Kategorie-ID ('sonstiges' ohne Zuordnung)
+  function fromKleinanzeigen(id) {
+    const n = Number(id);
+    for (const [key, c] of Object.entries(CATEGORIES)) if ((c.kleinanzeigen || []).includes(n)) return key;
+    return 'sonstiges';
+  }
+
+  const api = { CATEGORIES, DEFAULT, categoryOf, isCategory, attrs, value, priceParts, priceNumber, facts, lists, changeLabel, fromKleinanzeigen };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.Categories = api;
 })(typeof window !== 'undefined' ? window : this);

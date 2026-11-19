@@ -10,6 +10,7 @@
 
 const fetch   = require('node-fetch');
 const cheerio = require('cheerio');
+const Categories = require('../public/js/categories');
 const dns     = require('dns');
 const http    = require('http');
 const https   = require('https');
@@ -141,6 +142,71 @@ function detectPlatform(url) {
   if (url.includes('rentola.de'))           return 'rentola';
   if (url.includes('meinestadt.de'))        return 'meinestadt';
   return 'unbekannt';
+}
+
+// Fotos einer Kleinanzeigen-Anzeige → d.images_json / d.image_url
+function collectKleinanzeigenImages($, d) {
+  // Primary: match Kleinanzeigen's stable CDN URL pattern directly (robust
+  // against markup/class-name changes and doesn't get filtered out by
+  // extension checks, since these URLs carry no real file extension).
+  let imgs = collectKleinanzeigenGalleryImages($);
+  if (!imgs.length) {
+    // Fallback to the old selector-based approach in case the CDN pattern changes
+    imgs = collectImages($, ['#viewad-image img', '.galleryimage-element img', '[class*="gallery"] img']);
+  }
+  const og = $('meta[property="og:image"]').attr('content') || '';
+  if (og && !imgs.some(u => u.includes(og.split('?')[0]))) imgs.unshift(og);
+  d.images_json = JSON.stringify([...new Set(imgs)]);
+  d.image_url   = imgs[0] || '';
+}
+
+// Kategorie eines Suchagenten oder Inserats aus der URL. Kleinanzeigen trägt die Kategorie-ID
+// in Such-URLs (".../c216l1r20") und Anzeigen-URLs (".../3551630096-216-54"); die anderen
+// Portale sind reine Wohnungsportale. Kleinanzeigen-Suchen ohne Kategorie → "sonstiges".
+function kleinanzeigenCategoryId(url) {
+  let p = '';
+  try { p = new URL(url).pathname.replace(/\/+$/, ''); } catch (_) { return null; }
+  const ad = p.match(/^\/s-anzeige\/.*\/\d+-(\d+)-\d+$/);
+  if (ad) return Number(ad[1]);
+  // letzter Abschnitt z. B. "c216l1r20" oder mit Stichwort-Teil "k0c203l1"
+  const search = p.match(/\/(?:k\d+)?c(\d+)(?:l\d+)?(?:r\d+)?$/);
+  return search ? Number(search[1]) : null;
+}
+function detectCategory(url) {
+  if (detectPlatform(url) !== 'kleinanzeigen') return 'wohnung';
+  const id = kleinanzeigenCategoryId(url);
+  return id == null ? 'sonstiges' : Categories.fromKleinanzeigen(id);
+}
+
+// Eckdaten-Liste einer Kleinanzeigen-Anzeige ("Kilometerstand  191.521 km", "Zimmer  3") als
+// { kilometerstand: '191.521 km', zimmer: '3' }. Schlüssel: klein, ohne Umlaute, nur a-z0-9_.
+const KA_ATTR_ALIASES = { kraftstoffart: 'kraftstoff', hu_bis: 'hu' };
+function attrKey(label) {
+  const k = label.toLowerCase().replace(/ä/g, 'ae').replace(/ö/g, 'oe').replace(/ü/g, 'ue').replace(/ß/g, 'ss')
+    .replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 40);
+  return KA_ATTR_ALIASES[k] || k;
+}
+function extractKleinanzeigenDetails($) {
+  const out = {};
+  $('#viewad-details .addetailslist--detail').each((_, el) => {
+    const $el = $(el);
+    const value = $el.find('.addetailslist--detail--value').first().text().replace(/\s+/g, ' ').trim();
+    // Bezeichnung: eigenes Label-Element (ältere Seiten) oder der Text vor dem Wert
+    const label = ($el.find('.addetailslist--detail--label').first().text()
+      || $el.clone().children().remove().end().text()).replace(/\s+/g, ' ').trim();
+    const key = label && attrKey(label);
+    if (key && value && !(key in out)) out[key] = value.slice(0, 200);
+  });
+  return out;
+}
+// "Ausstattung"-Häkchen einer Kleinanzeigen-Anzeige (bei Autos: Klimaanlage, Navi …)
+function extractKleinanzeigenChecktags($) {
+  const tags = [];
+  $('#viewad-configuration .checktag, .checktaglist .checktag').each((_, el) => {
+    const t = $(el).text().replace(/\s+/g, ' ').trim();
+    if (t && t.length < 60 && !tags.includes(t)) tags.push(t);
+  });
+  return tags;
 }
 
 async function fetchPage(url, timeoutMs = 18000, allowedFailCodes = []) {
@@ -546,7 +612,8 @@ const AMENITY_KEYWORDS = [
 ];
 
 // ── Extract tags/features from listing ───────────────────
-function extractTags($, platform, descText) {
+// category: nur bei Wohnungen gibt es die Ausstattungs-Liste und die Stichwörter (Balkon, Garten …)
+function extractTags($, platform, descText, category = 'wohnung') {
   const tags = new Set();
 
   if (platform === 'kleinanzeigen') {
@@ -554,7 +621,7 @@ function extractTags($, platform, descText) {
     // — reliably scoped to just this listing's own amenities, unlike broad
     // class selectors which also catch UI buttons and unrelated preview
     // cards from the "Andere Anzeigen des Anbieters" section.
-    const ausstattung = extractKleinanzeigenAusstattung($);
+    const ausstattung = category === 'wohnung' ? extractKleinanzeigenAusstattung($) : [];
     ausstattung.forEach(t => tags.add(t));
     // Deliberately NO generic DOM-selector fallback here anymore: broad
     // selectors like [class*="tag"] repeatedly proved unreliable, pulling
@@ -592,7 +659,7 @@ function extractTags($, platform, descText) {
   }
 
   // Mine common keywords from description
-  AMENITY_KEYWORDS.forEach(kw => {
+  if (category === 'wohnung') AMENITY_KEYWORDS.forEach(kw => {
     if (new RegExp(`\\b${kw}\\b`, 'i').test(descText)) tags.add(kw);
   });
 
@@ -1152,6 +1219,7 @@ async function scrapeListing(url, opts = {}) {
     tags_json: '[]', status: 'active',
     nebenkosten: '', heizkosten: '', kaution: '', available_from: '', property_type: '',
     latitude: null, longitude: null,
+    category: detectCategory(url), attrs_json: '{}',
   };
 
   if (platform === 'vonovia') return scrapeVonovia(url, d, opts);
@@ -1276,81 +1344,79 @@ async function scrapeListing(url, opts = {}) {
       : $('[data-testid="description"]');
     d.description = extractTextWithParagraphs($, descEl).substring(0, 3000);
 
-    $('#viewad-details .addetailslist--detail').each((_, el) => {
-      const lbl = $(el).find('.addetailslist--detail--label').text().toLowerCase();
-      const val = $(el).find('span:last-child').text().trim();
-      if (/zimmer/.test(lbl))           d.rooms      = val;
-      if (/fläche|größe/.test(lbl))     d.size       = val;
-      if (/kalt|netto|grund/.test(lbl)) d.price_cold = extractPrice(val) || val;
-    });
+    const details = extractKleinanzeigenDetails($);
+    if (d.category !== 'wohnung') {
+      // Autos & Co.: Eckdaten als Zusatzangaben, Ausstattung als Tags, ein Preis ("11.800 € VB")
+      d.attrs_json = JSON.stringify(details);
+      const priceText = ($('#viewad-price').first().text() || $('[data-testid="price"]').first().text()).replace(/\s+/g, ' ');
+      const pm = priceText.match(/(\d[\d.,]*\s*€)(\s*VB)?/);
+      d.price = pm ? `${pm[1].trim()}${pm[2] ? ' VB' : ''}` : (/zu verschenken/i.test(priceText) ? 'Zu verschenken' : '');
+      extraFactTags.push(...extractKleinanzeigenChecktags($));
+      collectKleinanzeigenImages($, d);
+    } else {
+      for (const [key, val] of Object.entries(details)) {
+        if (key === 'zimmer')                                        d.rooms = d.rooms || val;
+        if (key === 'wohnflaeche' || key === 'flaeche')              d.size  = d.size || val;
+        if (/^(kaltmiete|nettokaltmiete|grundmiete)$/.test(key))     d.price_cold = d.price_cold || extractPrice(val) || val;
+      }
 
-    // Additional structured fields (Warmmiete, Nebenkosten, Heizkosten,
-    // Kaution, Wohnungstyp, Verfügbar ab, Wohnfläche, Zimmer, Schlafzimmer,
-    // Badezimmer, Etage) — text-pattern based, so they survive markup
-    // changes the same way the price fallback below does. This is also the
-    // ONLY source for newer listing layouts that render facts as a bare
-    // "Label Value" list with no class our old selector-based approach knew
-    // to look for (which is why d.size/d.rooms were sometimes ending up
-    // completely empty despite the data clearly being on the page).
-    const visibleBody = getVisibleText($, 'body');
-    const costFields   = extractKleinanzeigenCostFields($, visibleBody);
-    Object.assign(d, {
-      nebenkosten:    costFields.nebenkosten,
-      heizkosten:     costFields.heizkosten,
-      kaution:        costFields.kaution,
-      available_from: costFields.available_from,
-      property_type:  costFields.property_type,
-    });
-    if (!d.size)  d.size  = costFields.wohnflaeche;
-    if (!d.rooms) d.rooms = costFields.zimmer_count;
+      // Additional structured fields (Warmmiete, Nebenkosten, Heizkosten,
+      // Kaution, Wohnungstyp, Verfügbar ab, Wohnfläche, Zimmer, Schlafzimmer,
+      // Badezimmer, Etage) — text-pattern based, so they survive markup
+      // changes the same way the price fallback below does. This is also the
+      // ONLY source for newer listing layouts that render facts as a bare
+      // "Label Value" list with no class our old selector-based approach knew
+      // to look for (which is why d.size/d.rooms were sometimes ending up
+      // completely empty despite the data clearly being on the page).
+      const visibleBody = getVisibleText($, 'body');
+      const costFields   = extractKleinanzeigenCostFields($, visibleBody);
+      Object.assign(d, {
+        nebenkosten:    costFields.nebenkosten,
+        heizkosten:     costFields.heizkosten,
+        kaution:        costFields.kaution,
+        available_from: costFields.available_from,
+        property_type:  costFields.property_type,
+      });
+      if (!d.size)  d.size  = costFields.wohnflaeche;
+      if (!d.rooms) d.rooms = costFields.zimmer_count;
 
-    // Schlafzimmer/Badezimmer/Etage don't have dedicated DB columns, but
-    // they're useful at-a-glance facts, so surface them as extra tags.
-    if (costFields.schlafzimmer) extraFactTags.push(`${costFields.schlafzimmer} Schlafzimmer`);
-    if (costFields.badezimmer)   extraFactTags.push(`${costFields.badezimmer} Badezimmer`);
-    if (costFields.etage)        extraFactTags.push(`Etage ${costFields.etage}`);
+      // Schlafzimmer/Badezimmer/Etage don't have dedicated DB columns, but
+      // they're useful at-a-glance facts, so surface them as extra tags.
+      if (costFields.schlafzimmer) extraFactTags.push(`${costFields.schlafzimmer} Schlafzimmer`);
+      if (costFields.badezimmer)   extraFactTags.push(`${costFields.badezimmer} Badezimmer`);
+      if (costFields.etage)        extraFactTags.push(`Etage ${costFields.etage}`);
 
-    // Some listings show their amenities as a bare, unlabeled list (no
-    // "Ausstattung" heading at all — just "Balkon / Terrasse / Einbauküche"
-    // sitting right after the cost figures), which extractKleinanzeigenAusstattung()
-    // can't find since it specifically looks for that heading. As a safety
-    // net, scan the already-cleaned page text (other listings already
-    // stripped above) for the same amenity keywords used elsewhere — word
-    // boundaries keep this safe from Kleinanzeigen's own footer category
-    // links ("Dachgeschosswohnung in Gröpelingen" etc. don't match
-    // "Dachgeschoss" as a whole word).
-    AMENITY_KEYWORDS.forEach(kw => {
-      if (new RegExp(`\\b${kw}\\b`, 'i').test(visibleBody)) extraFactTags.push(kw);
-    });
+      // Some listings show their amenities as a bare, unlabeled list (no
+      // "Ausstattung" heading at all — just "Balkon / Terrasse / Einbauküche"
+      // sitting right after the cost figures), which extractKleinanzeigenAusstattung()
+      // can't find since it specifically looks for that heading. As a safety
+      // net, scan the already-cleaned page text (other listings already
+      // stripped above) for the same amenity keywords used elsewhere — word
+      // boundaries keep this safe from Kleinanzeigen's own footer category
+      // links ("Dachgeschosswohnung in Gröpelingen" etc. don't match
+      // "Dachgeschoss" as a whole word).
+      AMENITY_KEYWORDS.forEach(kw => {
+        if (new RegExp(`\\b${kw}\\b`, 'i').test(visibleBody)) extraFactTags.push(kw);
+      });
 
-    // price_cold: prefer the addetailslist label match above; otherwise the
-    // standalone price heading (common on corporate/property-management
-    // listings that show the base rent as a bare "490 €" under the title
-    // rather than in any consistently labeled element); otherwise the
-    // legacy description-text pattern fallback.
-    if (!d.price_cold) d.price_cold = findStandalonePriceHeading($) || findKaltmiete($, d.description);
+      // price_cold: prefer the addetailslist label match above; otherwise the
+      // standalone price heading (common on corporate/property-management
+      // listings that show the base rent as a bare "490 €" under the title
+      // rather than in any consistently labeled element); otherwise the
+      // legacy description-text pattern fallback.
+      if (!d.price_cold) d.price_cold = findStandalonePriceHeading($) || findKaltmiete($, d.description);
 
-    // price (rendered as the "warm" figure whenever it differs from
-    // price_cold): prefer an explicit Warmmiete match; else fall back to
-    // the classic selector-based price extraction (still valid for
-    // simpler/older private listings); else mirror price_cold so at least
-    // one figure is always shown instead of "Preis nicht angegeben".
-    d.price = costFields.price_warm
-           || extractPrice($('[data-testid="price"]').text() || $('.priceintro').text() || $('strong.price-big').text())
-           || d.price_cold;
+      // price (rendered as the "warm" figure whenever it differs from
+      // price_cold): prefer an explicit Warmmiete match; else fall back to
+      // the classic selector-based price extraction (still valid for
+      // simpler/older private listings); else mirror price_cold so at least
+      // one figure is always shown instead of "Preis nicht angegeben".
+      d.price = costFields.price_warm
+             || extractPrice($('[data-testid="price"]').text() || $('.priceintro').text() || $('strong.price-big').text())
+             || d.price_cold;
 
-    // Primary: match Kleinanzeigen's stable CDN URL pattern directly (robust
-    // against markup/class-name changes and doesn't get filtered out by
-    // extension checks, since these URLs carry no real file extension).
-    let imgs = collectKleinanzeigenGalleryImages($);
-    if (!imgs.length) {
-      // Fallback to the old selector-based approach in case the CDN pattern changes
-      imgs = collectImages($, ['#viewad-image img', '.galleryimage-element img', '[class*="gallery"] img']);
+      collectKleinanzeigenImages($, d);
     }
-    const og = $('meta[property="og:image"]').attr('content') || '';
-    if (og && !imgs.some(u => u.includes(og.split('?')[0]))) imgs.unshift(og);
-    d.images_json = JSON.stringify([...new Set(imgs)]);
-    d.image_url   = imgs[0] || '';
   }
   else if (platform === 'immoscout') {
     d.title       = $('h1').first().text().trim();
@@ -1566,7 +1632,7 @@ async function scrapeListing(url, opts = {}) {
   }
 
   // Tags
-  const baseTags = extractTags($, platform, d.description);
+  const baseTags = extractTags($, platform, d.description, d.category);
   const allTags  = [...new Set([...(typeof extraFactTags !== 'undefined' ? extraFactTags : []), ...baseTags])];
   d.tags_json = JSON.stringify(allTags.slice(0, 12));
 
@@ -1648,7 +1714,8 @@ async function pollSearchJob(job, exists, insert) {
 }
 
 module.exports = {
-  pollSearchJob, checkExistingListings, detectPlatform, scrapeListing, fetchPageRaw, checkListingStatus,
+  pollSearchJob, checkExistingListings, detectPlatform, detectCategory, scrapeListing, fetchPageRaw, checkListingStatus,
+  extractKleinanzeigenDetails, extractKleinanzeigenChecktags,
   validateSearchUrl, vonoviaSearchUrls, parseVonoviaDetail,
   legSearchUrls, parseLegDetail, gewobaSearchUrls, parseGewobaDetail,
   // Shared with index.js for the other places that call out to a
